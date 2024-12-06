@@ -40,13 +40,24 @@ def convert_to_asc(filename, force=False):
         return
 
     try:
-        # Write data to .asc format
+        # Write data to .asc format with the required headers
         with open(newfilename, 'w') as asc_file:
+            # Write the header information
+            asc_file.write('(DAS)^2 2-D text output of image region:\n')
+            asc_file.write(f'Number of pixels in X direction =       {data.shape[1]}\n')
+            asc_file.write(f'Number of pixels in Y direction =       {data.shape[0]}\n')
+            asc_file.write('X starting pixel of ROI =          1\n')
+            asc_file.write('Y starting pixel of ROI =          1\n')
+            asc_file.write('ROI pixel values follow (X-direction changing fastest, bottom left first):\n')
+
+            # Write the data values
             for row in data:
-                asc_file.write(' '.join(map(str, row)) + '\n')
+                asc_file.write('      ' + '      '.join(map(str, row)) + '\n')
         print(f'Converted {filename} to {newfilename}')
     except Exception as e:
         logging.error(f"Error writing {newfilename}: {e}")
+        
+        
 def _interpret(arr):
     """Adapted from libmagic.
 
