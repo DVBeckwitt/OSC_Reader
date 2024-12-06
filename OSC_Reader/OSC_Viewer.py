@@ -5,8 +5,6 @@ from matplotlib.widgets import Slider
 import time
 import argparse
 import os
-from numba import jit
-
 
 def visualize_osc_data(filename):
     """Visualizes an OSC file as an interactive plot.
@@ -24,11 +22,8 @@ def visualize_osc_data(filename):
         print(f"An error occurred while reading the file: {e}")
         return  # Exit the function if file reading fails
 
-    # Convert data from big-endian to little-endian (native format)
-    data = data.astype('<u2')
-
-    # Convert data to float64 for compatibility with Numba
-    data = data.astype(np.float64)
+    # If necessary, adjust the byte order without changing data values
+    # data = data.byteswap().newbyteorder()
 
     # Set up the plot with additional areas for cross-sections along X and Y
     fig = plt.figure(figsize=(18, 12), dpi=80)

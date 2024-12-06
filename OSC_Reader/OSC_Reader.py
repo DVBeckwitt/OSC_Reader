@@ -47,8 +47,6 @@ def convert_to_asc(filename, force=False):
         print(f'Converted {filename} to {newfilename}')
     except Exception as e:
         logging.error(f"Error writing {newfilename}: {e}")
-
-
 def _interpret(arr):
     """Adapted from libmagic.
 
@@ -93,8 +91,14 @@ Diagnostic information:
     logbook.debug(diagnostics)
 
     try:
-        return (arr.view(endian + 'u2')[-(width * height):]
-                .reshape((width, height)))
+        reshaped_arr = (arr.view(endian + 'u2')[-(width * height):]
+                        .reshape((width, height)))
+        
+        # Apply bit-shifting for values greater than 32767, excluding the already-handled values
+        mask = reshaped_arr >= 32767
+        reshaped_arr[mask] = (reshaped_arr[mask] << 5) & 0xFFFF  # Perform the shift safely
+
+        return reshaped_arr
     except ValueError as err:
         raise ShapeError(
             """Couldn't convert this array because of a problem interpreting
