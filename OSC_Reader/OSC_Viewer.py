@@ -20,63 +20,51 @@ def visualize_osc_data(filename):
         print("Data loaded successfully.")
     except Exception as e:
         print(f"An error occurred while reading the file: {e}")
-        return  # Exit the function if file reading fails
+        return
 
-    # If necessary, adjust the byte order without changing data values
-    # data = data.byteswap().newbyteorder()
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(5, 4, width_ratios=[0.5, 4, 0.5, 0.5],
+                          height_ratios=[4, 1, 0.5, 0.5, 0.5],
+                          wspace=0.3, hspace=0.4)
 
-    # Set up the plot with additional areas for cross-sections along X and Y
-    fig = plt.figure(figsize=(18, 12), dpi=80)
-
-    # Define gridspec for layout
-    gs = fig.add_gridspec(5, 4, width_ratios=[0.5, 4, 0.5, 0.5], height_ratios=[4, 1, 0.5, 0.5, 0.5], wspace=0.2, hspace=0.3)
-
-    # Create axes for the different parts
     ax_image = fig.add_subplot(gs[0, 1])
     ax_x_profile = fig.add_subplot(gs[1, 1], sharex=ax_image)
-    ax_y_profile = fig.add_subplot(gs[0, 0], sharey=ax_image)  # Moved to the left of the image
-    ax_vmin_slider = fig.add_subplot(gs[3, 1])  # Slider for vmin
-    ax_vmax_slider = fig.add_subplot(gs[4, 1])  # Slider for vmax
-    ax_text_box = fig.add_subplot(gs[2, 1])  # Text box for showing X, Y, and intensity
+    ax_y_profile = fig.add_subplot(gs[0, 0], sharey=ax_image)
+    ax_vmin_slider = fig.add_subplot(gs[3, 1])
+    ax_vmax_slider = fig.add_subplot(gs[4, 1])
+    ax_text_box = fig.add_subplot(gs[2, 1])
 
     # Hide axes for the text box
     ax_text_box.axis('off')
 
-    # Display the RAXIS image
+    # Use 'extent' to ensure that pixel indices match the image coordinates exactly
     vmin_default = 0
     vmax_default = np.mean(data)
-    im = ax_image.imshow(data, cmap='turbo', vmin=vmin_default, vmax=vmax_default, aspect='equal')
+    im = ax_image.imshow(data, cmap='turbo', vmin=vmin_default, vmax=vmax_default,
+                         aspect='equal', extent=[0, data.shape[1], data.shape[0], 0])
+
     ax_image.set_title('RAXIS Image')
     ax_image.set_xlabel('X pixels')
     ax_image.set_ylabel('Y pixels')
 
-    # Add crosshair lines (disable anti-aliasing to improve performance)
     horizontal_line = ax_image.axhline(color='red', lw=0.8, alpha=0.7, antialiased=False)
     vertical_line = ax_image.axvline(color='red', lw=0.8, alpha=0.7, antialiased=False)
 
-    # Add line plots for cross-sections along X and Y axes
     x_cross_section_line, = ax_x_profile.plot(data[0, :], color='blue')
     y_cross_section_line, = ax_y_profile.plot(data[:, 0], np.arange(data.shape[0]), color='green')
 
-    # Add markers for the cross-section positions
     x_marker, = ax_x_profile.plot([], [], 'ro')
     y_marker, = ax_y_profile.plot([], [], 'ro')
 
-    # Customize cross-section plots
     ax_x_profile.set_ylabel('Intensity')
     ax_x_profile.set_xlim(0, data.shape[1])
     ax_y_profile.set_xlabel('Intensity')
     ax_y_profile.set_ylim(0, data.shape[0])
     ax_y_profile.invert_yaxis()
 
-    # Adjust layout to ensure proper alignment
-    ax_image.set_position([0.15, 0.4, 0.5, 0.5])  # Manually adjust position of the main image to be square
-    ax_x_profile.set_position([0.15, 0.25, 0.5, 0.1])  # Adjust the x-profile below the image with matching width
-    ax_vmin_slider.set_position([0.15, 0.15, 0.5, 0.03])  # Place vmin slider below the x-profile
-    ax_vmax_slider.set_position([0.15, 0.1, 0.5, 0.03])  # Place vmax slider below the vmin slider
-    ax_text_box.set_position([0.7, 0.4, 0.25, 0.1])  # Place text box on the right of the image
-
     dragging = False
+    update_interval = 0.03
+    last_update_time = time.time()
 
     def on_press(event):
         nonlocal dragging
@@ -99,7 +87,6 @@ def visualize_osc_data(filename):
 
         if dragging and event.inaxes == ax_image and event.xdata is not None and event.ydata is not None:
             x, y = int(event.xdata), int(event.ydata)
-
             if 0 <= x < data.shape[1] and 0 <= y < data.shape[0]:
                 intensity = data[y, x]
 
@@ -128,22 +115,17 @@ def visualize_osc_data(filename):
     fig.canvas.mpl_connect('button_release_event', on_release)
     fig.canvas.mpl_connect('motion_notify_event', update_crosshair)
 
-    last_update_time = time.time()
-    update_interval = 0.03
-
     slider_vmin = Slider(ax_vmin_slider, 'Vmin', min(0, np.min(data)), np.max(data), valinit=vmin_default)
     slider_vmax = Slider(ax_vmax_slider, 'Vmax', np.min(data), np.max(data), valinit=vmax_default)
 
     def update_vmin_vmax(val):
-        vmin = slider_vmin.val
-        vmax = slider_vmax.val
-        im.set_clim(vmin, vmax)
+        im.set_clim(slider_vmin.val, slider_vmax.val)
         fig.canvas.draw_idle()
 
     slider_vmin.on_changed(update_vmin_vmax)
     slider_vmax.on_changed(update_vmin_vmax)
 
-    plt.tight_layout()
+    fig.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
@@ -151,7 +133,6 @@ if __name__ == "__main__":
     parser.add_argument('filename', type=str, help='The path to the OSC file to be visualized.')
     args = parser.parse_args()
 
-    # Validate the provided filename
     if not os.path.isfile(args.filename):
         print(f"Error: The file '{args.filename}' does not exist.")
     else:

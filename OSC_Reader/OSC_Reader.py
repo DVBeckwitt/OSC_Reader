@@ -57,31 +57,24 @@ def convert_to_asc(filename, force=False):
     except Exception as e:
         logging.error(f"Error writing {newfilename}: {e}")
         
-        
 def _interpret(arr):
-    """Adapted from libmagic.
-
-       See file-5.14/magic/Magdir/scientific
-       available at ftp://ftp.astron.com/pub/file/file-5.14.tar.gz
+    """Adapted from libmagic and modified to apply the discovered transformation.
 
        Parameters
        ----------
-       arr : ndarray
-         1-dimensional ndarray of dtype uint8 containing the
-         whole RAXIS file
+       arr : ndarray (uint8)
+         1-dimensional ndarray of dtype uint8 containing the whole RAXIS file
 
        Returns
        -------
-       arr : ndarray
-         2-dimensional uint16 array of RAXIS detector data
+       arr : ndarray (int32)
+         2-dimensional int32 array of transformed RAXIS detector data
     """
-    # Check the version field to determine the endianess
+    # Determine endianness from the version field
     version = arr[796:800].view('>u4')[0]
     endian = '>' if version < 20 else '<'
 
-    # Width and height must be cast to at least a uint64 to
-    # safely multiply them. (Otherwise default numpy rules
-    # result in multiplication modulo 2 ** 32.)
+    # Read width and height
     width = int(arr[768:772].view(endian + 'u4')[0])
     height = int(arr[772:776].view(endian + 'u4')[0])
 
@@ -89,32 +82,42 @@ def _interpret(arr):
                  .format('big' if endian == '>' else 'little',
                          width, height))
 
-    diagnostics = """
+    diagnostics = f"""
 Diagnostic information:
-    length of the raw array (in bytes): {}
-    length of the raw array / 4 :       {}
-    width:                              {}
-    height:                             {}
-    len / 4 - (width * height):         {}
-""".format(len(arr), len(arr) // 4, width, height,
-           len(arr) // 4 - (width * height))
-
+    length of the raw array (in bytes): {len(arr)}
+    length of the raw array / 4 :       {len(arr) // 4}
+    width:                              {width}
+    height:                             {height}
+    len / 4 - (width * height):         {len(arr) // 4 - (width * height)}
+"""
     logbook.debug(diagnostics)
 
     try:
+        # Extract the final width * height 16-bit words
         reshaped_arr = (arr.view(endian + 'u2')[-(width * height):]
                         .reshape((width, height)))
-        
-        # Apply bit-shifting for values greater than 32767, excluding the already-handled values
-        mask = reshaped_arr >= 32767
-        reshaped_arr[mask] = (reshaped_arr[mask] << 5) & 0xFFFF  # Perform the shift safely
 
-        return reshaped_arr
+        # Convert to int32 for safe arithmetic
+        int32_arr = reshaped_arr.astype('int32')
+
+        # Correctly interpret signed 16-bit:
+        # Values >= 0x8000 represent negative numbers and require subtracting 0x10000.
+        mask = int32_arr >= 0x8000
+        int32_arr[mask] -= 0x10000
+        int32_arr[mask] += 0x8000
+        int32_arr[mask] *= 32
+        
+        # Apply the discovered transformation: (signed_val + 0x8000) * 32
+        final_arr = int32_arr
+
+        return final_arr
+
     except ValueError as err:
         raise ShapeError(
             """Couldn't convert this array because of a problem interpreting
                its shape. This file may be corrupt.
             """ + diagnostics, original_exception=err) from err
+
 
 def read_osc(filename, RAW = False):
     """Reads a RAXIS OSC file into an ndarray
