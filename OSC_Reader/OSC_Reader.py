@@ -13,6 +13,8 @@ class ShapeError(Exception):
         self.original_exception = original_exception
 
 
+
+
 def convert_to_asc(filename, force=False):
     """Converts a RAXIS file to an ASCII grid file (.asc).
 
@@ -33,16 +35,17 @@ def convert_to_asc(filename, force=False):
         return
 
     try:
-        # Read the RAXIS file to get data as a 2D array
-        data = read_osc(filename)
+        # Directly read raw bytes and interpret them using _interpret.
+        raw = np.fromfile(filename, dtype='u1')
+        if raw[:5].tobytes() != b'RAXIS':
+            raise IOError("This file doesn't seem to be a RAXIS file at all. Aborting!")
+        data = _interpret(raw)
     except Exception as e:
         logging.error(f"Error reading {filename}: {e}")
         return
 
     try:
-        # Write data to .asc format with the required headers
         with open(newfilename, 'w') as asc_file:
-            # Write the header information
             asc_file.write('(DAS)^2 2-D text output of image region:\n')
             asc_file.write(f'Number of pixels in X direction =       {data.shape[1]}\n')
             asc_file.write(f'Number of pixels in Y direction =       {data.shape[0]}\n')
@@ -50,12 +53,21 @@ def convert_to_asc(filename, force=False):
             asc_file.write('Y starting pixel of ROI =          1\n')
             asc_file.write('ROI pixel values follow (X-direction changing fastest, bottom left first):\n')
 
-            # Write the data values
-            for row in data:
-                asc_file.write('      ' + '      '.join(map(str, row)) + '\n')
+            max_val = data.max()
+            width = len(str(max_val)) + 1  # One space more than the largest number's length
+            # get the rows
+            rows, cols = data.shape
+            
+            for row_idx in range(rows):
+                row_data = data[row_idx, :]
+                for start in range(0, cols, 10):
+                    line_values = row_data[start:start+10]
+                    asc_file.write(''.join(f"{val:{width}d}" for val in line_values) + '\n')
+
         print(f'Converted {filename} to {newfilename}')
     except Exception as e:
         logging.error(f"Error writing {newfilename}: {e}")
+
         
 def _interpret(arr):
     """Adapted from libmagic and modified to apply the discovered transformation.
@@ -93,13 +105,14 @@ Diagnostic information:
     logbook.debug(diagnostics)
 
     try:
-        # Extract the final width * height 16-bit words
-        reshaped_arr = (arr.view(endian + 'u2')[-(width * height):]
-                        .reshape((width, height)))
+        # Adjust this offset based on the known RAXIS file structure:
+        data_start_offset = 6000
+        pixel_count = width * height
+        # Extract pixel data starting at the known offset
+        pixel_data = arr[data_start_offset:].view(endian + 'u2')[:pixel_count].reshape((height, width))
 
         # Convert to int32 for safe arithmetic
-        int32_arr = reshaped_arr.astype('int32')
-
+        int32_arr = pixel_data.astype('int32')
         # Correctly interpret signed 16-bit:
         # Values >= 0x8000 represent negative numbers and require subtracting 0x10000.
         mask = int32_arr >= 0x8000

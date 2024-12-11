@@ -41,7 +41,7 @@ def visualize_osc_data(filename):
     vmin_default = 0
     vmax_default = np.mean(data)
     im = ax_image.imshow(data, cmap='turbo', vmin=vmin_default, vmax=vmax_default,
-                         aspect='equal', extent=[0, data.shape[1], data.shape[0], 0])
+                         aspect='equal', extent=[0, data.shape[1], 0, data.shape[0]])
 
     ax_image.set_title('RAXIS Image')
     ax_image.set_xlabel('X pixels')
