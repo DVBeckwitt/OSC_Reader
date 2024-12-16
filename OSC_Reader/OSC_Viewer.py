@@ -37,11 +37,11 @@ def visualize_osc_data(filename):
     # Hide axes for the text box
     ax_text_box.axis('off')
 
-    # Use 'extent' to ensure that pixel indices match the image coordinates exactly
+    # Display the image with the origin at the lower-left corner so the indexing matches the data array
     vmin_default = 0
     vmax_default = np.mean(data)
     im = ax_image.imshow(data, cmap='turbo', vmin=vmin_default, vmax=vmax_default,
-                         aspect='equal', extent=[0, data.shape[1], 0, data.shape[0]])
+                         aspect='equal', extent=[0, data.shape[1], 0, data.shape[0]], origin='lower')
 
     ax_image.set_title('RAXIS Image')
     ax_image.set_xlabel('X pixels')
@@ -102,8 +102,30 @@ def visualize_osc_data(filename):
                 x_marker.set_data(x, x_cross_section[x])
                 y_marker.set_data(y_cross_section[y], y)
 
-                ax_x_profile.set_ylim(np.min(x_cross_section), np.max(x_cross_section))
-                ax_y_profile.set_xlim(np.min(y_cross_section), np.max(y_cross_section))
+                # Adjust the profiles to the currently visible (zoomed) portion of the image
+                xlims = ax_image.get_xlim()
+                ylims = ax_image.get_ylim()
+
+                # Visible portion for x profile (horizontal line) is determined by xlims
+                x_start = max(int(np.floor(min(xlims))), 0)
+                x_end = min(int(np.ceil(max(xlims))), data.shape[1]-1)
+
+                # Visible portion for y profile (vertical line) is determined by ylims
+                y_start = max(int(np.floor(min(ylims))), 0)
+                y_end = min(int(np.ceil(max(ylims))), data.shape[0]-1)
+
+                if x_start < x_end:
+                    visible_x_section = x_cross_section[x_start:x_end+1]
+                else:
+                    visible_x_section = x_cross_section[x:x+1]
+
+                if y_start < y_end:
+                    visible_y_section = y_cross_section[y_start:y_end+1]
+                else:
+                    visible_y_section = y_cross_section[y:y+1]
+
+                ax_x_profile.set_ylim(np.min(visible_x_section), np.max(visible_x_section))
+                ax_y_profile.set_xlim(np.min(visible_y_section), np.max(visible_y_section))
 
                 ax_text_box.clear()
                 ax_text_box.axis('off')
