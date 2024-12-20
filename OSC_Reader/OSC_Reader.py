@@ -1,5 +1,6 @@
 import numpy as np
 import logbook
+import cv2
 
 from os.path import splitext, exists
 import logging
@@ -13,7 +14,24 @@ class ShapeError(Exception):
         self.original_exception = original_exception
 
 
-
+def osc2jpg(input_file):
+    # Read the OSC file into a numpy array
+    data = read_osc(input_file)
+    # find the median value of the data that is above 100
+    median = np.median(data[data > 500])
+    # any data above the median gets set to the median
+    data[data > median] = median
+    # Normalize data to 0-255 for display as an 8-bit image
+    min_val, max_val = data.min(), data.max()
+    # If the image is uniform, handle that edge case
+    if min_val == max_val:
+        image_array = np.zeros_like(data, dtype=np.uint8)
+    else:
+        image_array = (255 * (data - min_val) / (max_val - min_val)).astype(np.uint8)
+    output_file = f"{splitext(input_file)[0]}.jpg"
+    # Write the image to a JPG file
+    cv2.imwrite(output_file, image_array)
+    print(f"Converted {input_file} to {output_file}")
 
 def convert_to_asc(filename, force=False):
     """Converts a RAXIS file to an ASCII grid file (.asc).
