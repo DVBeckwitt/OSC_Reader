@@ -1,18 +1,18 @@
 """Utility functions for XRD analysis and image processing."""
 
 import json
-import numpy as np
+from pathlib import Path
+
+import fabio
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import pyFAI
 from scipy.ndimage import rotate
 from scipy.optimize import curve_fit
-import pyFAI
-import fabio
-from pathlib import Path
-from OSC_Reader import read_osc
-import dvb
-from dvb import * 
-from dvb import  pa
+
+from .OSC_Reader import read_osc
+from . import peak_analysis as pa
 
 try:
     import datashader as ds
