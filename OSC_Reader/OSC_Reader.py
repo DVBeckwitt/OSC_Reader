@@ -17,10 +17,9 @@ class ShapeError(Exception):
 def osc2jpg(input_file):
     # Read the OSC file into a numpy array
     data = read_osc(input_file)
-    # find the median value of the data that is above 100
-    median = np.median(data[data > 500])
-    # any data above the median gets set to the median
-    data[data > median] = median
+    # Take the log of the data to enhance contrast
+    data = np.log(data)
+
     # Normalize data to 0-255 for display as an 8-bit image
     min_val, max_val = data.min(), data.max()
     # If the image is uniform, handle that edge case
