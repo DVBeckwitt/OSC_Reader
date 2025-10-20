@@ -1,5 +1,6 @@
 import numpy as np
-from OSC_Reader import read_osc
+
+from .OSC_Reader import read_osc
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 import time
