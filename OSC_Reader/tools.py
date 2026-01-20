@@ -12,7 +12,17 @@ from scipy.ndimage import rotate
 from scipy.optimize import curve_fit
 
 from .OSC_Reader import read_osc
-from . import peak_analysis as pa
+
+def _load_peak_analysis():
+    """Import peak_analysis only when needed."""
+    try:
+        from . import peak_analysis
+    except Exception as exc:
+        raise ImportError(
+            "The peak_analysis module is required for this operation. "
+            "Install optional dependencies such as lmfit to enable it."
+        ) from exc
+    return peak_analysis
 
 try:
     import datashader as ds
@@ -552,7 +562,8 @@ def plot_qz_vs_qr(
         [7, 12, -20, 20, "003"],
         [29, 32, 54, 66, "119"]
     ]
-    intensity, phi, theta, region_data = pa.process_data(
+    peak_analysis = _load_peak_analysis()
+    intensity, phi, theta, region_data = peak_analysis.process_data(
         ai,
         data,
         regions,
