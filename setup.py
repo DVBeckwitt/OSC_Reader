@@ -17,6 +17,7 @@ setup(
         'tifffile>=2020.9.3',
         'docopt>=0.6.2',
         'logbook>=1.5.3',
+        'opencv-python>=4.0.0',
     ],
     classifiers=[
         'Development Status :: 3 - Alpha',
