@@ -2,16 +2,31 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-from lmfit.models import (
-    GaussianModel,
-    LorentzianModel,
-    LinearModel,
-    ConstantModel,
-    PseudoVoigtModel,
-    PolynomialModel,
-)
-from lmfit.lineshapes import gaussian, lorentzian
 import matplotlib.gridspec as gridspec
+
+
+def _load_lmfit_models():
+    from lmfit.models import (
+        GaussianModel,
+        LorentzianModel,
+        LinearModel,
+        ConstantModel,
+        PseudoVoigtModel,
+        PolynomialModel,
+    )
+    return {
+        "GaussianModel": GaussianModel,
+        "LorentzianModel": LorentzianModel,
+        "LinearModel": LinearModel,
+        "ConstantModel": ConstantModel,
+        "PseudoVoigtModel": PseudoVoigtModel,
+        "PolynomialModel": PolynomialModel,
+    }
+
+
+def _load_lmfit_lineshapes():
+    from lmfit.lineshapes import gaussian, lorentzian
+    return gaussian, lorentzian
 
 ##############################################################################
 # 1) Helper functions
@@ -126,6 +141,11 @@ def perform_fit(x, y, lower_bound, upper_bound, equal_weight_fit=False):
     if y.size == 0 or not np.any(y > 0):
         return None
 
+    models = _load_lmfit_models()
+    GaussianModel = models["GaussianModel"]
+    LorentzianModel = models["LorentzianModel"]
+    LinearModel = models["LinearModel"]
+
     amp, cen, sigma = estimate_initial_parameters(x, y)
 
     gauss = GaussianModel(prefix='g_')
@@ -171,6 +191,8 @@ def plot_fit_with_components(ax_obj, x_data, y_data, fit_result, x_label, use_lo
     ax_obj.plot(x_data, y_data, 'ko', label='Raw Data', markersize=4, zorder=1)
     x_smooth = np.linspace(x_data.min(), x_data.max(), 300)
     y_fit_total = fit_result.eval(x=x_smooth)
+
+    gaussian, lorentzian = _load_lmfit_lineshapes()
     
     # Extract parameters from the fit result
     g_amp = fit_result.params['g_amplitude'].value
@@ -307,6 +329,12 @@ def fit_pvoigt_peaks(
             mask &= qz <= end
         qz = qz[mask]
         intensity = intensity[mask]
+
+    models = _load_lmfit_models()
+    PolynomialModel = models["PolynomialModel"]
+    LinearModel = models["LinearModel"]
+    ConstantModel = models["ConstantModel"]
+    PseudoVoigtModel = models["PseudoVoigtModel"]
 
     if background_type == "polynomial":
         background = PolynomialModel(background_degree, prefix="bkg_")
