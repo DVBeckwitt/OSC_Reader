@@ -15,13 +15,7 @@ from .OSC_Reader import read_osc
 
 def _load_peak_analysis():
     """Import peak_analysis only when needed."""
-    try:
-        from . import peak_analysis
-    except Exception as exc:
-        raise ImportError(
-            "The peak_analysis module is required for this operation. "
-            "Install optional dependencies such as lmfit to enable it."
-        ) from exc
+    from . import peak_analysis
     return peak_analysis
 
 try:
