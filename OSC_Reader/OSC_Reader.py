@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Dict, Tuple
+
 import numpy as np
 import logbook
 import cv2
@@ -12,6 +17,11 @@ class ShapeError(Exception):
     def __init__(self, message, original_exception=None):
         super().__init__(message)
         self.original_exception = original_exception
+
+
+_OPTIONAL_EXPORTS: Dict[str, Tuple[str, str]] = {
+    "plot_qr": ("tools", "plot_qr"),
+}
 
 
 def osc2jpg(input_file):
@@ -118,7 +128,7 @@ Diagnostic information:
     width:                              {width}
     height:                             {height}
     len / 4 - (width * height):         {len(arr) // 4 - (width * height)}
-"""
+    """
     logbook.debug(diagnostics)
 
     try:
@@ -172,3 +182,22 @@ def read_osc(filename, RAW = False):
         return  _interpret(raw), raw
     else:
         return _interpret(raw)
+
+
+def __getattr__(name: str):
+    if name in _OPTIONAL_EXPORTS:
+        module_name, attr_name = _OPTIONAL_EXPORTS[name]
+        module = import_module(f".{module_name}", __package__)
+        attr = getattr(module, attr_name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+__all__ = [
+    "ShapeError",
+    "convert_to_asc",
+    "osc2jpg",
+    "read_osc",
+    *_OPTIONAL_EXPORTS.keys(),
+]
