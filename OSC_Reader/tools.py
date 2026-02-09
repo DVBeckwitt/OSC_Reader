@@ -64,7 +64,8 @@ def _auto_alpha(sample_minus_dark: np.ndarray,
 
 
 def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
-            title=None, show=True, vmin=0, log_intensity=False):
+            title=None, show=True, vmin=0, log_intensity=False,
+            save_img=None, high_res_dpi=600):
     """Plot a dark-subtracted OSC image with the beam center highlighted.
 
     Parameters
@@ -82,6 +83,11 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
     log_intensity : bool, optional
         When ``True``, render the image with logarithmic color scaling.
         Values less than or equal to zero are masked. Defaults to ``False``.
+    save_img : str or pathlib.Path, optional
+        If provided, save a high-resolution image to this path with the
+        center marker removed.
+    high_res_dpi : int, optional
+        DPI used for ``save_img`` output. Defaults to ``600``.
     title : str, optional
         Title for the plot. Defaults to the sample file name.
     show : bool, optional
@@ -130,14 +136,31 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
         )
     else:
         im = ax.imshow(data, cmap="turbo", vmin=vmin, vmax=vmax, origin="lower")
-    ax.scatter(x_center, y_center, c="red", s=100, marker="o", label="PONI center")
+    center_marker = ax.scatter(
+        x_center, y_center, c="red", s=100, marker="o", label="PONI center"
+    )
     if title is None:
         title = Path(sample_path).stem
     ax.set_title(title)
     ax.set_xlabel("x (pixels)")
     ax.set_ylabel("y (pixels)")
-    ax.legend()
+    legend = ax.legend()
     plt.colorbar(im, ax=ax)
+
+    if save_img is not None:
+        center_marker.set_visible(False)
+        if legend is not None:
+            legend.set_visible(False)
+        fig.savefig(
+            save_img,
+            bbox_inches="tight",
+            pad_inches=0,
+            dpi=high_res_dpi,
+        )
+        center_marker.set_visible(True)
+        if legend is not None:
+            legend.set_visible(True)
+
     if show:
         plt.show()
     return data
