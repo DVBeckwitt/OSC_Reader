@@ -65,7 +65,7 @@ def _auto_alpha(sample_minus_dark: np.ndarray,
 
 def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
             title=None, show=True, vmin=0, log_intensity=False,
-            save_img=None, high_res_dpi=600):
+            save_img=None, high_res_dpi=600, substrate_scale=None):
     """Plot a dark-subtracted OSC image with the beam center highlighted.
 
     Parameters
@@ -88,6 +88,9 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
         center marker removed.
     high_res_dpi : int, optional
         DPI used for ``save_img`` output. Defaults to ``600``.
+    substrate_scale : float, optional
+        Multiplicative scale applied to ``substrate_path`` before subtraction.
+        When ``None``, an automatic scale factor is estimated.
     title : str, optional
         Title for the plot. Defaults to the sample file name.
     show : bool, optional
@@ -111,8 +114,10 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
     if substrate_path is not None:
         substrate_image = read_osc(substrate_path).astype(float, copy=False)
 
-        # ---------- new bits ----------
-        alpha = _auto_alpha(data, substrate_image)
+        if substrate_scale is None:
+            alpha = _auto_alpha(data, substrate_image)
+        else:
+            alpha = float(substrate_scale)
         data  -= alpha * substrate_image
 
 
