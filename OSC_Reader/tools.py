@@ -5,18 +5,18 @@ from pathlib import Path
 
 import fabio
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import numpy as np
 import pandas as pd
-import pyFAI
 from scipy.ndimage import rotate
 from scipy.optimize import curve_fit
 
 from .OSC_Reader import read_osc
 
-def _load_peak_analysis():
-    """Import peak_analysis only when needed."""
-    from . import peak_analysis
-    return peak_analysis
+try:
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+except Exception:  # pragma: no cover - legacy pyFAI fallback
+    from pyFAI import AzimuthalIntegrator
 
 try:
     import datashader as ds
@@ -64,7 +64,7 @@ def _auto_alpha(sample_minus_dark: np.ndarray,
 
 
 def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
-            title=None, show=True, vmin=0):
+            title=None, show=True, vmin=0, log_intensity=False):
     """Plot a dark-subtracted OSC image with the beam center highlighted.
 
     Parameters
@@ -73,12 +73,15 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
         Path to the sample ``.osc`` file.
     dark_path : str
         Path to the dark ``.osc`` file.
-    ai : :class:`pyFAI.AzimuthalIntegrator`
+    ai : :class:`pyFAI.integrator.azimuthal.AzimuthalIntegrator`
         Integrator containing calibration parameters.
     vmax : float, optional
         Upper bound for the colormap. Defaults to ``200``.
     vmin : float, optional
         Lower bound for the colormap. Defaults to ``0``.
+    log_intensity : bool, optional
+        When ``True``, render the image with logarithmic color scaling.
+        Values less than or equal to zero are masked. Defaults to ``False``.
     title : str, optional
         Title for the plot. Defaults to the sample file name.
     show : bool, optional
@@ -111,7 +114,22 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
     y_center = ai.poni1 / ai.pixel2
 
     fig, ax = plt.subplots(figsize=(12, 8))
-    im = ax.imshow(data, cmap="turbo", vmin=vmin, vmax=vmax, origin="lower")
+    if log_intensity:
+        positive_mask = np.isfinite(data) & (data > 0)
+        if not np.any(positive_mask):
+            raise ValueError("display(log_intensity=True) requires at least one positive intensity value.")
+        log_vmin = np.min(data[positive_mask]) if vmin is None or vmin <= 0 else vmin
+        log_vmax = np.max(data[positive_mask]) if vmax is None or vmax <= 0 else vmax
+        if log_vmax <= log_vmin:
+            raise ValueError("For logarithmic display, vmax must be greater than vmin and both must be > 0.")
+        im = ax.imshow(
+            data,
+            cmap="turbo",
+            norm=LogNorm(vmin=log_vmin, vmax=log_vmax),
+            origin="lower",
+        )
+    else:
+        im = ax.imshow(data, cmap="turbo", vmin=vmin, vmax=vmax, origin="lower")
     ax.scatter(x_center, y_center, c="red", s=100, marker="o", label="PONI center")
     if title is None:
         title = Path(sample_path).stem
@@ -126,13 +144,13 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
 
 
 def setup_azimuthal_integrator(file_path, base_distance=0.075):
-    """Return a :class:`pyFAI.AzimuthalIntegrator` using values from a .poni file."""
+    """Return a :class:`pyFAI.integrator.azimuthal.AzimuthalIntegrator` from a .poni file."""
     params = parse_poni_file(file_path)
     detector_config = json.loads(params.get("Detector_config", "{}"))
     pixel1 = float(detector_config.get("pixel1", 1e-4))
     pixel2 = float(detector_config.get("pixel2", 1e-4))
 
-    ai = pyFAI.AzimuthalIntegrator(
+    ai = AzimuthalIntegrator(
         dist=base_distance,
         poni1=params.get("Poni1", 0.0),
         poni2=params.get("Poni2", 0.0),
@@ -417,6 +435,12 @@ def plot_qz_vs_qr(
     qz_min=0.1,
     qz_max=3.5,
     plot=True,
+    npt_rad=3000,
+    npt_azim=1000,
+    integration_method="full",
+    normalize_region=(7, 12, -20, 20),
+    scaling_factor=100.0,
+    wavelength=1.5406,
 ):
     """Calculate ``qr`` and ``qz`` coordinates from an OSC image.
 
@@ -424,7 +448,7 @@ def plot_qz_vs_qr(
     ----------
     thetai : float
         Incident angle in degrees.
-    ai : :class:`pyFAI.AzimuthalIntegrator`
+    ai : :class:`pyFAI.integrator.azimuthal.AzimuthalIntegrator`
         Integrator describing the detector geometry.
     data : array-like
         2D intensity image (OSC).
@@ -442,6 +466,24 @@ def plot_qz_vs_qr(
         When ``True`` the computed ``qr``/``qz`` map is displayed using
         :func:`plot_q`. Set to ``False`` to skip plotting. Defaults to
         ``True``.
+    npt_rad : int, optional
+        Number of radial bins for ``ai.integrate2d``. Lower values run faster.
+        Defaults to ``3000``.
+    npt_azim : int, optional
+        Number of azimuthal bins for ``ai.integrate2d``. Lower values run
+        faster. Defaults to ``1000``.
+    integration_method : str, optional
+        Method passed to ``ai.integrate2d`` (for example ``"full"`` or
+        ``"bbox"``). Defaults to ``"full"``.
+    normalize_region : tuple or None, optional
+        ``(theta_min, theta_max, phi_min, phi_max)`` used to normalize the
+        integrated intensity to ``scaling_factor``. Set to ``None`` to disable.
+    scaling_factor : float, optional
+        Multiplicative scale used before integration and as the normalization
+        target. Defaults to ``100.0``.
+    wavelength : float, optional
+        X-ray wavelength in Angstrom used to convert angles to reciprocal-space
+        coordinates. Defaults to ``1.5406``.
 
     Returns
     -------
@@ -453,10 +495,13 @@ def plot_qz_vs_qr(
 
     if hkl_list is None and qr_adjust == 0.15 and qz_min == 0.1 and qz_max == 3.5:
         # Backwards compatible defaults
+        q10 = q(1, 0, 0, a1, c1)
+        q11 = q(1, 1, 0, a1, c1)
+        q20 = q(2, 0, 0, a1, c1)
         boxes = {
             "L(10L)": {
-                "qr_min": -q(1, 0, 0, a1, c1) - 0.15,
-                "qr_max": -q(1, 0, 0, a1, c1) + 0.15,
+                "qr_min": -q10 - 0.15,
+                "qr_max": -q10 + 0.15,
                 "qz_min": 0.1,
                 "qz_max": 3.5,
                 "qrm2": -2,
@@ -465,8 +510,8 @@ def plot_qz_vs_qr(
                 "linestyle": "-.",
             },
             "R(10L)": {
-                "qr_min": q(1, 0, 0, a1, c1) - 0.15,
-                "qr_max": q(1, 0, 0, a1, c1) + 0.15,
+                "qr_min": q10 - 0.15,
+                "qr_max": q10 + 0.15,
                 "qz_min": 0.1,
                 "qz_max": 3.5,
                 "qrm2": 1.95,
@@ -475,8 +520,8 @@ def plot_qz_vs_qr(
                 "linestyle": "-",
             },
             "L(20L)": {
-                "qr_min": -q(1, 1, 0, a1, c1) - 0.15,
-                "qr_max": -q(1, 1, 0, a1, c1) + 0.15,
+                "qr_min": -q11 - 0.15,
+                "qr_max": -q11 + 0.15,
                 "qz_min": 0.1,
                 "qz_max": 3.3,
                 "qrm2": -3,
@@ -485,8 +530,8 @@ def plot_qz_vs_qr(
                 "linestyle": ":",
             },
             "R(20L)": {
-                "qr_min": q(1, 1, 0, a1, c1) - 0.15,
-                "qr_max": q(1, 1, 0, a1, c1) + 0.15,
+                "qr_min": q11 - 0.15,
+                "qr_max": q11 + 0.15,
                 "qz_min": 0.1,
                 "qz_max": 3.3,
                 "qrm2": 3.35,
@@ -495,8 +540,8 @@ def plot_qz_vs_qr(
                 "linestyle": "--",
             },
             "L(2,0,L)": {
-                "qr_min": -q(2, 0, 0, a1, c1) - 0.15,
-                "qr_max": -q(2, 0, 0, a1, c1) + 0.15,
+                "qr_min": -q20 - 0.15,
+                "qr_max": -q20 + 0.15,
                 "qz_min": 0.1,
                 "qz_max": 3.3,
                 "qrm2": -4,
@@ -505,8 +550,8 @@ def plot_qz_vs_qr(
                 "linestyle": "-.",
             },
             "R(2,0,L)": {
-                "qr_min": q(2, 0, 0, a1, c1) - 0.15,
-                "qr_max": q(2, 0, 0, a1, c1) + 0.15,
+                "qr_min": q20 - 0.15,
+                "qr_max": q20 + 0.15,
                 "qz_min": 0.1,
                 "qz_max": 3.3,
                 "qrm2": 3.95,
@@ -554,23 +599,45 @@ def plot_qz_vs_qr(
                 "linestyle": "-",
             }
 
-    regions = [
-        [7, 12, -20, 20, "003"],
-        [29, 32, 54, 66, "119"]
-    ]
-    peak_analysis = _load_peak_analysis()
-    intensity, phi, theta, region_data = peak_analysis.process_data(
-        ai,
-        data,
-        regions,
-        do_fitting=False,
-        show_plots=False,
-    )
+    data_for_integration = np.asarray(data, dtype=float)
+    if normalize_region is None and scaling_factor != 1:
+        data_for_integration = data_for_integration * scaling_factor
 
-    # ``phi`` and ``theta`` are returned in degrees as 1D arrays representing the
-    # azimuthal and radial axes of the integrated image.  Create 2D grids in
-    # radians so they broadcast correctly with ``intensity`` when calculating
-    # reciprocal space coordinates.
+    integration_result = ai.integrate2d(
+        data_for_integration,
+        npt_rad=npt_rad,
+        correctSolidAngle=True,
+        npt_azim=npt_azim,
+        method=integration_method,
+        unit="2th_deg",
+    )
+    intensity = integration_result.intensity
+    theta = integration_result.radial
+    phi = integration_result.azimuthal
+
+    # Match historical azimuthal convention used by the old process_data path.
+    phi = np.where(phi < 0.0, phi + 180.0, phi - 180.0)
+    sort_indices = np.argsort(phi)
+    phi = phi[sort_indices]
+    intensity = intensity[sort_indices, :]
+
+    # Keep only rows with |phi| < 90 degrees.
+    phi_mask = (phi > -90.0) & (phi < 90.0)
+    phi = phi[phi_mask]
+    intensity = intensity[phi_mask, :]
+
+    if normalize_region is not None:
+        theta_min, theta_max, phi_min, phi_max = normalize_region
+        theta_mask = (theta >= theta_min) & (theta <= theta_max)
+        norm_phi_mask = (phi >= phi_min) & (phi <= phi_max)
+        if np.any(theta_mask) and np.any(norm_phi_mask):
+            norm_slice = intensity[np.ix_(norm_phi_mask, theta_mask)]
+            if norm_slice.size > 0:
+                max_val = np.nanmax(norm_slice)
+                if np.isfinite(max_val) and max_val > 0:
+                    intensity = (intensity / max_val) * scaling_factor
+
+    # Build 2D grids in radians for broadcasting.
     phi = np.deg2rad(phi)[:, None]
     theta = np.deg2rad(theta)[None, :]
 
@@ -579,18 +646,23 @@ def plot_qz_vs_qr(
     sin_theta = np.sin(theta)
     cos_theta = np.cos(theta)
 
-    k = 2 * np.pi / 1.5406
+    k = 2 * np.pi / wavelength
     thetai_rad = np.deg2rad(thetai)
+    sin_thetai = np.sin(thetai_rad)
+    cos_thetai = np.cos(thetai_rad)
 
-    qx = sin_theta * sin_phi * k
+    delta_cos = cos_theta - 1.0
     st_cp = sin_theta * cos_phi
-    qy = (np.cos(thetai_rad) * (cos_theta - 1) + np.sin(thetai_rad) * st_cp) * k
-    qz = (-np.sin(thetai_rad) * (cos_theta - 1) + np.cos(thetai_rad) * st_cp) * k
+    qy = (cos_thetai * delta_cos + sin_thetai * st_cp) * k
+    qz = (-sin_thetai * delta_cos + cos_thetai * st_cp) * k
 
-    # Determine the sign of ``qr`` using the broadcast ``phi`` array
-    qr = np.where(phi >= 0, np.hypot(qx, qy), -np.hypot(qx, qy))
+    # Compute the qr magnitude once, then apply sign by azimuth.
+    qr_mag = np.hypot((sin_theta * sin_phi) * k, qy)
+    qr = np.where(phi >= 0.0, qr_mag, -qr_mag)
 
-    df = pd.DataFrame({"x": qr.ravel(), "y": qz.ravel(), "intensity": intensity.ravel()})
+    df = pd.DataFrame(
+        {"x": qr.reshape(-1), "y": qz.reshape(-1), "intensity": intensity.reshape(-1)}
+    )
 
     if plot:
         vm = df["intensity"].max()
