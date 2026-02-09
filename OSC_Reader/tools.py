@@ -64,7 +64,7 @@ def _auto_alpha(sample_minus_dark: np.ndarray,
 
 
 def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
-            title=None, show=True):
+            title=None, show=True, vmin=0):
     """Plot a dark-subtracted OSC image with the beam center highlighted.
 
     Parameters
@@ -77,6 +77,8 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
         Integrator containing calibration parameters.
     vmax : float, optional
         Upper bound for the colormap. Defaults to ``200``.
+    vmin : float, optional
+        Lower bound for the colormap. Defaults to ``0``.
     title : str, optional
         Title for the plot. Defaults to the sample file name.
     show : bool, optional
@@ -109,7 +111,7 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
     y_center = ai.poni1 / ai.pixel2
 
     fig, ax = plt.subplots(figsize=(12, 8))
-    im = ax.imshow(data, cmap="turbo", vmin=0, vmax=vmax, origin="lower")
+    im = ax.imshow(data, cmap="turbo", vmin=vmin, vmax=vmax, origin="lower")
     ax.scatter(x_center, y_center, c="red", s=100, marker="o", label="PONI center")
     if title is None:
         title = Path(sample_path).stem
