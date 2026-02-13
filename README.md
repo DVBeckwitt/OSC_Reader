@@ -1,5 +1,7 @@
 # OSC Reader and Diffraction Toolkit
 
+![OSC Reader viewer preview](docs/viewer_preview.png)
+
 `OSC_Reader` is a lightweight toolkit for working with Rigaku RAXIS `.osc`
 images.  It now bundles the diffraction utilities from the former
 `DVB_pack` project, providing a single, streamlined package for loading raw
@@ -80,12 +82,6 @@ Viewer controls:
 - `Save Image`: export current rendered image view
 - `Bottom Log Y`: toggle log scale for bottom profile intensity axis
 - `Side Log X`: toggle log scale for side profile intensity axis
-
-### Viewer Preview
-
-Add your screenshot at `docs/viewer_preview.png` and it will render below:
-
-![OSC Reader viewer preview](docs/viewer_preview.png)
 
 Windows users can also launch with the included batch file:
 
