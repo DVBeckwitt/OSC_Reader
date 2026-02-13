@@ -14,7 +14,7 @@ fitting.
 - **Convert to ASCII grid files (`.asc`)** for numerical analysis.
 - **Convert to JPEG images** for easy sharing or documentation.
 - **Interactive viewer** with cross‑hair inspection, pixel intensity
-  readouts, and adjustable intensity scaling.
+  readouts, adjustable intensity scaling, and high-FPS rendering.
 - **Diffraction utilities** (`OSC_Reader.tools`) for azimuthal integration,
   reciprocal space plotting and detector corrections.
 - **Peak analysis helpers** (`OSC_Reader.peak_analysis`) for fitting and
@@ -26,8 +26,8 @@ fitting.
 pip install .
 ```
 
-This installs the core `OSC_Reader` package along with its minimal
-dependencies.  The diffraction and peak-analysis utilities rely on
+This installs the core `OSC_Reader` package with dependencies for the
+interactive high-FPS viewer. The diffraction and peak-analysis utilities rely on
 additional scientific packages such as `matplotlib`, `pandas`, `pyFAI`,
 `fabio`, `scipy`, and `lmfit`.  Install them with your preferred package
 manager when you need those features.
@@ -65,6 +65,40 @@ Run the viewer as a script to explore pixel values and cross sections:
 
 ```bash
 python -m OSC_Reader.OSC_Viewer path/to/example.osc
+```
+
+or launch without a path to pick a file in a GUI dialog:
+
+```bash
+python -m OSC_Reader.OSC_Viewer
+```
+
+Viewer controls:
+- Move mouse over image: update crosshair and side/bottom profiles
+- Left-click + drag: zoom to region
+- `Reset Zoom`: return to full frame
+- `Save Image`: export current rendered image view
+- `Bottom Log Y`: toggle log scale for bottom profile intensity axis
+- `Side Log X`: toggle log scale for side profile intensity axis
+
+### Viewer Preview
+
+Add your screenshot at `docs/viewer_preview.png` and it will render below:
+
+![OSC Reader viewer preview](docs/viewer_preview.png)
+
+Windows users can also launch with the included batch file:
+
+```bat
+Run_OSC_Viewer.bat
+```
+
+You can drag and drop an `.osc` file onto `Run_OSC_Viewer.bat` to open that file directly.
+
+To set this viewer as the default app for `.osc` files (current user), run:
+
+```bat
+Register_OSC_Default_App.bat
 ```
 
 or call it directly from Python:

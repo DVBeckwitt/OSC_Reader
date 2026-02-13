@@ -15,7 +15,6 @@ from importlib import import_module
 from typing import Dict, Tuple
 
 from .OSC_Reader import ShapeError, convert_to_asc, osc2jpg, read_osc
-from .OSC_Viewer import visualize_osc_data
 
 __all__ = [
     "ShapeError",
@@ -87,6 +86,11 @@ def _load_optional_module(module_name: str):
 
 def __getattr__(name: str):
     """Lazily expose optional modules and symbols."""
+    if name == "visualize_osc_data":
+        module = import_module(".OSC_Viewer", __name__)
+        attr = getattr(module, name)
+        globals()[name] = attr
+        return attr
     if name in _OPTIONAL_SUBMODULES:
         try:
             return _load_optional_module(name)

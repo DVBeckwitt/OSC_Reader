@@ -18,6 +18,8 @@ setup(
         'docopt>=0.6.2',
         'logbook>=1.5.3',
         'opencv-python>=4.0.0',
+        'pyqtgraph>=0.14.0',
+        'pyside6>=6.5.0',
     ],
     classifiers=[
         'Development Status :: 3 - Alpha',
