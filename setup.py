@@ -14,6 +14,7 @@ setup(
     url='https://github.com/DVBeckwitt/OSC_Reader',
     install_requires=[
         'numpy>=1.18.0',
+        'numba>=0.59.0',
         'tifffile>=2020.9.3',
         'docopt>=0.6.2',
         'logbook>=1.5.3',

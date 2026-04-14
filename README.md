@@ -16,7 +16,8 @@ fitting.
 - **Convert to ASCII grid files (`.asc`)** for numerical analysis.
 - **Convert to JPEG images** for easy sharing or documentation.
 - **Interactive viewer** with cross‑hair inspection, pixel intensity
-  readouts, adjustable intensity scaling, and high-FPS rendering.
+  readouts, adjustable intensity scaling, high-FPS rendering, and direct
+  detector-to-`φ`/`2θ` conversion from user-supplied geometry.
 - **Diffraction utilities** (`OSC_Reader.tools`) for azimuthal integration,
   reciprocal space plotting and detector corrections.
 - **Peak analysis helpers** (`OSC_Reader.peak_analysis`) for fitting and
@@ -80,6 +81,10 @@ Viewer controls:
 - Left-click + drag: zoom to region
 - `Reset Zoom`: return to full frame
 - `Save Image`: export current rendered image view
+- `Pick Beam Center`: click the detector image to place the beam center
+- `Distance`, `Pixel Size`, `2θ Bins`, `φ Bins`: set geometry/input values for conversion
+- `Convert to φ/2θ`: convert the currently loaded detector image using the 24-worker angle-space pipeline
+- `Show Detector`: switch back from the converted `φ`/`2θ` view to the raw detector image
 - `Bottom Log Y`: toggle log scale for bottom profile intensity axis
 - `Side Log X`: toggle log scale for side profile intensity axis
 

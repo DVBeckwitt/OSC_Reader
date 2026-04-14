@@ -26,6 +26,20 @@ __all__ = [
 
 # Mapping of attribute name -> (submodule name, attribute name inside module).
 _OPTIONAL_EXPORTS: Dict[str, Tuple[str, str]] = {
+    # Angle-space module exports
+    "DEFAULT_ANGLE_SPACE_ENGINE": ("angle_space", "DEFAULT_ANGLE_SPACE_ENGINE"),
+    "DEFAULT_ANGLE_SPACE_WORKERS": ("angle_space", "DEFAULT_ANGLE_SPACE_WORKERS"),
+    "DEFAULT_PHI_MAX_DEG": ("angle_space", "DEFAULT_PHI_MAX_DEG"),
+    "DEFAULT_PHI_MIN_DEG": ("angle_space", "DEFAULT_PHI_MIN_DEG"),
+    "DEFAULT_TWO_THETA_MAX_DEG": ("angle_space", "DEFAULT_TWO_THETA_MAX_DEG"),
+    "DEFAULT_TWO_THETA_MIN_DEG": ("angle_space", "DEFAULT_TWO_THETA_MIN_DEG"),
+    "DetectorCakeGeometry": ("angle_space", "DetectorCakeGeometry"),
+    "DetectorCakeResult": ("angle_space", "DetectorCakeResult"),
+    "build_angle_axes": ("angle_space", "build_angle_axes"),
+    "convert_image_to_phi_2theta_space": ("angle_space", "convert_image_to_phi_2theta_space"),
+    "flat_solid_angle_normalization": ("angle_space", "flat_solid_angle_normalization"),
+    "integrate_detector_to_cake_exact": ("angle_space", "integrate_detector_to_cake_exact"),
+    "prepare_gui_phi_display": ("angle_space", "prepare_gui_phi_display"),
     # Tools module exports
     "parse_poni_file": ("tools", "parse_poni_file"),
     "display": ("tools", "display"),
@@ -62,7 +76,7 @@ _OPTIONAL_EXPORTS: Dict[str, Tuple[str, str]] = {
 _OPTIONAL_SUBMODULES = {
     name for name, _ in _OPTIONAL_EXPORTS.values()
 }
-_OPTIONAL_SUBMODULES.update({"tools", "peak_analysis", "viewer"})
+_OPTIONAL_SUBMODULES.update({"angle_space", "tools", "peak_analysis", "viewer"})
 
 # Import cache and error registry for optional modules.
 _module_cache: Dict[str, object] = {}

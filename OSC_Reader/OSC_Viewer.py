@@ -5,6 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .angle_space import (
+    DEFAULT_ANGLE_SPACE_WORKERS,
+    convert_image_to_phi_2theta_space,
+    prepare_gui_phi_display,
+)
 from .OSC_Reader import read_osc
 
 try:
@@ -46,6 +51,59 @@ if QtCore is not None and _QtSignal is not None:
                 self.finished.emit()
 
 
+if QtCore is not None and _QtSignal is not None:
+    class _AngleSpaceWorker(QtCore.QObject):
+        loaded = _QtSignal(object)
+        failed = _QtSignal(str)
+        finished = _QtSignal()
+
+        def __init__(
+            self,
+            image,
+            *,
+            distance_mm,
+            pixel_size_mm,
+            center_row_px,
+            center_col_px,
+            radial_bins,
+            azimuth_bins,
+        ):
+            super().__init__()
+            self.image = np.asarray(image)
+            self.distance_mm = float(distance_mm)
+            self.pixel_size_mm = float(pixel_size_mm)
+            self.center_row_px = float(center_row_px)
+            self.center_col_px = float(center_col_px)
+            self.radial_bins = int(radial_bins)
+            self.azimuth_bins = int(azimuth_bins)
+
+        def run(self):
+            try:
+                result = convert_image_to_phi_2theta_space(
+                    self.image,
+                    distance_mm=self.distance_mm,
+                    pixel_size_mm=self.pixel_size_mm,
+                    center_row_px=self.center_row_px,
+                    center_col_px=self.center_col_px,
+                    radial_bins=self.radial_bins,
+                    azimuth_bins=self.azimuth_bins,
+                )
+                cake, radial_deg, phi_deg = prepare_gui_phi_display(result)
+            except Exception as exc:  # pragma: no cover - runtime/UI path
+                self.failed.emit(str(exc))
+            else:
+                self.loaded.emit(
+                    {
+                        "result": result,
+                        "cake": cake,
+                        "radial_deg": radial_deg,
+                        "phi_deg": phi_deg,
+                    }
+                )
+            finally:
+                self.finished.emit()
+
+
 class OSCViewerWindow(QtWidgets.QMainWindow):
     TARGET_FPS = 60.0
     MAX_PROFILE_POINTS = 800
@@ -58,10 +116,20 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
         self.filename = None
         self.data = None
+        self.detector_data = None
+        self.angle_space_result = None
+        self.angle_space_cake = None
         self.height = 0
         self.width = 0
         self.data_min = 0.0
         self.data_max = 1.0
+        self.current_view_mode = "detector"
+        self.display_x_full = np.array([], dtype=np.float64)
+        self.display_y_full = np.array([], dtype=np.float64)
+        self.display_x_edges = np.array([], dtype=np.float64)
+        self.display_y_edges = np.array([], dtype=np.float64)
+        self.display_x_label = "X pixels"
+        self.display_y_label = "Y pixels"
 
         self.pending_x = None
         self.pending_y = None
@@ -78,8 +146,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.bottom_log_enabled = False
         self.left_log_enabled = False
         self._loading = False
+        self._converting = False
         self._loader_thread = None
         self._loader_worker = None
+        self._conversion_thread = None
+        self._conversion_worker = None
+        self.beam_center_row = None
+        self.beam_center_col = None
 
         self._build_ui()
         if filename:
@@ -127,6 +200,41 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             return self._safe_limits_log(np.min(positive), np.max(positive))
         return self._safe_limits_linear(np.min(values), np.max(values))
 
+    @staticmethod
+    def _coord_edges(coords):
+        coords = np.asarray(coords, dtype=np.float64)
+        if coords.size == 0:
+            return np.array([0.0, 1.0], dtype=np.float64)
+        if coords.size == 1:
+            value = float(coords[0])
+            return np.array([value - 0.5, value + 0.5], dtype=np.float64)
+        deltas = np.diff(coords)
+        edges = np.empty(coords.size + 1, dtype=np.float64)
+        edges[1:-1] = coords[:-1] + 0.5 * deltas
+        edges[0] = coords[0] - 0.5 * deltas[0]
+        edges[-1] = coords[-1] + 0.5 * deltas[-1]
+        return edges
+
+    @staticmethod
+    def _index_from_edges(value, edges):
+        index = int(np.searchsorted(edges, value, side="right") - 1)
+        return max(0, min(index, len(edges) - 2))
+
+    def _x_text(self, ix):
+        if self.current_view_mode == "detector":
+            return str(ix)
+        return f"{float(self.display_x_full[ix]):.3f}"
+
+    def _y_text(self, iy):
+        if self.current_view_mode == "detector":
+            return str(iy)
+        return f"{float(self.display_y_full[iy]):.3f}"
+
+    def _beam_center_summary(self):
+        if self.beam_center_row is None or self.beam_center_col is None:
+            return "Beam center: unset"
+        return f"Beam center: ({self.beam_center_col:.2f}, {self.beam_center_row:.2f}) px"
+
     def _estimate_data_stats(self):
         # Use a coarse sample for fast startup; profile axes are refined per-cursor.
         sample_target = 512
@@ -152,19 +260,73 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.open_button = QtWidgets.QPushButton("Open OSC")
         self.save_button = QtWidgets.QPushButton("Save Image")
         self.reset_button = QtWidgets.QPushButton("Reset Zoom")
+        self.show_detector_button = QtWidgets.QPushButton("Show Detector")
+        self.pick_center_button = QtWidgets.QPushButton("Pick Beam Center")
+        self.convert_button = QtWidgets.QPushButton("Convert to φ/2θ")
         self.bottom_log_button = QtWidgets.QPushButton("Bottom Log Y")
         self.left_log_button = QtWidgets.QPushButton("Side Log X")
+        self.pick_center_button.setCheckable(True)
         self.bottom_log_button.setCheckable(True)
         self.left_log_button.setCheckable(True)
         fps_label = QtWidgets.QLabel(f"Render target: {int(self.TARGET_FPS)} FPS")
         controls_layout.addWidget(self.open_button)
         controls_layout.addWidget(self.save_button)
         controls_layout.addWidget(self.reset_button)
+        controls_layout.addWidget(self.show_detector_button)
+        controls_layout.addWidget(self.pick_center_button)
+        controls_layout.addWidget(self.convert_button)
         controls_layout.addWidget(self.bottom_log_button)
         controls_layout.addWidget(self.left_log_button)
         controls_layout.addStretch(1)
         controls_layout.addWidget(fps_label)
         main_layout.addLayout(controls_layout)
+
+        geometry_layout = QtWidgets.QHBoxLayout()
+
+        self.center_col_spin = QtWidgets.QDoubleSpinBox()
+        self.center_row_spin = QtWidgets.QDoubleSpinBox()
+        self.distance_spin = QtWidgets.QDoubleSpinBox()
+        self.pixel_size_spin = QtWidgets.QDoubleSpinBox()
+        self.radial_bins_spin = QtWidgets.QSpinBox()
+        self.azimuth_bins_spin = QtWidgets.QSpinBox()
+
+        for spin in (self.center_col_spin, self.center_row_spin):
+            spin.setDecimals(2)
+            spin.setRange(-1_000_000.0, 1_000_000.0)
+            spin.setSingleStep(1.0)
+
+        self.distance_spin.setDecimals(4)
+        self.distance_spin.setRange(0.0001, 1_000_000.0)
+        self.distance_spin.setSingleStep(0.1)
+        self.distance_spin.setSuffix(" mm")
+        self.distance_spin.setValue(75.0)
+
+        self.pixel_size_spin.setDecimals(5)
+        self.pixel_size_spin.setRange(0.00001, 1000.0)
+        self.pixel_size_spin.setSingleStep(0.001)
+        self.pixel_size_spin.setSuffix(" mm")
+        self.pixel_size_spin.setValue(0.1)
+
+        for spin in (self.radial_bins_spin, self.azimuth_bins_spin):
+            spin.setRange(2, 10000)
+            spin.setSingleStep(10)
+        self.radial_bins_spin.setValue(1000)
+        self.azimuth_bins_spin.setValue(720)
+
+        geometry_layout.addWidget(QtWidgets.QLabel("Center X"))
+        geometry_layout.addWidget(self.center_col_spin)
+        geometry_layout.addWidget(QtWidgets.QLabel("Center Y"))
+        geometry_layout.addWidget(self.center_row_spin)
+        geometry_layout.addWidget(QtWidgets.QLabel("Distance"))
+        geometry_layout.addWidget(self.distance_spin)
+        geometry_layout.addWidget(QtWidgets.QLabel("Pixel Size"))
+        geometry_layout.addWidget(self.pixel_size_spin)
+        geometry_layout.addWidget(QtWidgets.QLabel("2θ Bins"))
+        geometry_layout.addWidget(self.radial_bins_spin)
+        geometry_layout.addWidget(QtWidgets.QLabel("φ Bins"))
+        geometry_layout.addWidget(self.azimuth_bins_spin)
+        geometry_layout.addStretch(1)
+        main_layout.addLayout(geometry_layout)
 
         self.graphics = pg.GraphicsLayoutWidget()
         self.graphics.ci.layout.setColumnStretchFactor(0, 1)
@@ -209,6 +371,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.h_line = pg.InfiniteLine(angle=0, movable=False, pen=crosshair_pen)
         self.image_plot.addItem(self.v_line)
         self.image_plot.addItem(self.h_line)
+        self.beam_center_marker = pg.ScatterPlotItem(
+            size=14,
+            brush=pg.mkBrush(0, 0, 0, 0),
+            pen=pg.mkPen("#ffd60a", width=2),
+            symbol="+",
+        )
+        self.image_plot.addItem(self.beam_center_marker)
 
         self.bottom_curve = self.bottom_plot.plot([], [], pen=pg.mkPen("#1e90ff", width=1))
         self.left_curve = self.left_plot.plot([], [], pen=pg.mkPen("#2ecc71", width=1))
@@ -224,8 +393,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.open_button.clicked.connect(self.open_file_dialog)
         self.save_button.clicked.connect(self.save_current_view)
         self.reset_button.clicked.connect(self.reset_zoom)
+        self.show_detector_button.clicked.connect(self.show_detector_view)
+        self.pick_center_button.toggled.connect(self._on_pick_center_toggled)
+        self.convert_button.clicked.connect(self.convert_active_image)
         self.bottom_log_button.toggled.connect(self.set_bottom_log_mode)
         self.left_log_button.toggled.connect(self.set_left_log_mode)
+        self.center_col_spin.valueChanged.connect(self._on_beam_center_spin_changed)
+        self.center_row_spin.valueChanged.connect(self._on_beam_center_spin_changed)
 
         self.mouse_proxy = pg.SignalProxy(
             self.image_plot.scene().sigMouseMoved,
@@ -244,8 +418,164 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def _set_interaction_enabled(self, enabled):
         self.save_button.setEnabled(enabled)
         self.reset_button.setEnabled(enabled)
+        self.show_detector_button.setEnabled(enabled and self.detector_data is not None)
+        self.pick_center_button.setEnabled(enabled and self.current_view_mode == "detector")
+        self.convert_button.setEnabled(enabled and self.detector_data is not None)
         self.bottom_log_button.setEnabled(enabled)
         self.left_log_button.setEnabled(enabled)
+        self.center_col_spin.setEnabled(enabled and self.detector_data is not None)
+        self.center_row_spin.setEnabled(enabled and self.detector_data is not None)
+        self.distance_spin.setEnabled(enabled and self.detector_data is not None)
+        self.pixel_size_spin.setEnabled(enabled and self.detector_data is not None)
+        self.radial_bins_spin.setEnabled(enabled and self.detector_data is not None)
+        self.azimuth_bins_spin.setEnabled(enabled and self.detector_data is not None)
+
+    def _set_beam_center(self, row, col, update_spins=True):
+        if self.detector_data is not None:
+            row = float(np.clip(row, 0.0, self.detector_data.shape[0] - 1))
+            col = float(np.clip(col, 0.0, self.detector_data.shape[1] - 1))
+        self.beam_center_row = float(row)
+        self.beam_center_col = float(col)
+        if update_spins:
+            self.center_row_spin.blockSignals(True)
+            self.center_col_spin.blockSignals(True)
+            self.center_row_spin.setValue(self.beam_center_row)
+            self.center_col_spin.setValue(self.beam_center_col)
+            self.center_row_spin.blockSignals(False)
+            self.center_col_spin.blockSignals(False)
+        self._update_beam_center_marker()
+
+    def _update_beam_center_marker(self):
+        visible = (
+            self.current_view_mode == "detector"
+            and self.detector_data is not None
+            and self.beam_center_row is not None
+            and self.beam_center_col is not None
+        )
+        self.beam_center_marker.setVisible(visible)
+        if visible:
+            self.beam_center_marker.setData(
+                [self.beam_center_col],
+                [self.beam_center_row],
+            )
+
+    def _on_beam_center_spin_changed(self, _value):
+        if self.detector_data is None:
+            return
+        self._set_beam_center(
+            self.center_row_spin.value(),
+            self.center_col_spin.value(),
+            update_spins=False,
+        )
+
+    def _on_pick_center_toggled(self, enabled):
+        if enabled and self.current_view_mode != "detector":
+            self.pick_center_button.blockSignals(True)
+            self.pick_center_button.setChecked(False)
+            self.pick_center_button.blockSignals(False)
+            return
+        if enabled:
+            self.info_label.setText(
+                "Click the detector image to place the beam center."
+            )
+        elif self.data is not None:
+            self.update_cursor(
+                self.last_ix if self.last_ix is not None else self.width // 2,
+                self.last_iy if self.last_iy is not None else self.height // 2,
+                force=True,
+            )
+
+    def _start_conversion(self):
+        if self._converting or self.detector_data is None:
+            return
+        if self.beam_center_row is None or self.beam_center_col is None:
+            self._set_beam_center(
+                (self.detector_data.shape[0] - 1) / 2.0,
+                (self.detector_data.shape[1] - 1) / 2.0,
+            )
+        if "_AngleSpaceWorker" not in globals():
+            try:
+                result = convert_image_to_phi_2theta_space(
+                    self.detector_data,
+                    distance_mm=self.distance_spin.value(),
+                    pixel_size_mm=self.pixel_size_spin.value(),
+                    center_row_px=self.beam_center_row,
+                    center_col_px=self.beam_center_col,
+                    radial_bins=self.radial_bins_spin.value(),
+                    azimuth_bins=self.azimuth_bins_spin.value(),
+                )
+                cake, radial_deg, phi_deg = prepare_gui_phi_display(result)
+            except Exception as exc:  # pragma: no cover - fallback error path
+                self._on_conversion_failed(str(exc))
+            else:
+                self._on_conversion_loaded(
+                    {
+                        "result": result,
+                        "cake": cake,
+                        "radial_deg": radial_deg,
+                        "phi_deg": phi_deg,
+                    }
+                )
+                self._set_interaction_enabled(self.data is not None)
+            return
+
+        self._converting = True
+        self.open_button.setEnabled(False)
+        self._set_interaction_enabled(False)
+        self.info_label.setText(
+            f"Converting to φ/2θ with {DEFAULT_ANGLE_SPACE_WORKERS} workers ..."
+        )
+
+        self._conversion_thread = QtCore.QThread(self)
+        self._conversion_worker = _AngleSpaceWorker(
+            self.detector_data,
+            distance_mm=self.distance_spin.value(),
+            pixel_size_mm=self.pixel_size_spin.value(),
+            center_row_px=self.beam_center_row,
+            center_col_px=self.beam_center_col,
+            radial_bins=self.radial_bins_spin.value(),
+            azimuth_bins=self.azimuth_bins_spin.value(),
+        )
+        self._conversion_worker.moveToThread(self._conversion_thread)
+
+        self._conversion_thread.started.connect(self._conversion_worker.run)
+        self._conversion_worker.loaded.connect(self._on_conversion_loaded)
+        self._conversion_worker.failed.connect(self._on_conversion_failed)
+        self._conversion_worker.finished.connect(self._conversion_thread.quit)
+        self._conversion_worker.finished.connect(self._conversion_worker.deleteLater)
+        self._conversion_thread.finished.connect(self._on_conversion_finished)
+        self._conversion_thread.finished.connect(self._conversion_thread.deleteLater)
+        self._conversion_thread.start()
+
+    def _on_conversion_loaded(self, payload):
+        self.angle_space_result = payload["result"]
+        self.angle_space_cake = payload["cake"]
+        self.show_angle_space_view(
+            payload["cake"],
+            payload["radial_deg"],
+            payload["phi_deg"],
+        )
+
+    def _on_conversion_failed(self, message):
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Conversion Error",
+            f"Failed to convert the active image to φ/2θ space.\n\n{message}",
+        )
+        if self.data is not None:
+            self.info_label.setText(
+                "Conversion failed. Adjust the geometry and try again."
+            )
+
+    def _on_conversion_finished(self):
+        self._converting = False
+        self.open_button.setEnabled(True)
+        self._set_interaction_enabled(self.data is not None)
+        self._conversion_worker = None
+        self._conversion_thread = None
+
+    def convert_active_image(self):
+        self._start_conversion()
 
     def _start_loader(self, filename):
         if self._loading:
@@ -299,7 +629,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._loader_thread = None
 
     def open_file_dialog(self):
-        if self._loading:
+        if self._loading or self._converting:
             return
         start_dir = str(Path(self.filename).parent) if self.filename else str(Path.cwd())
         selected, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -312,23 +642,61 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.load_file(selected)
 
     def load_file(self, filename):
+        if self._converting:
+            return
         if not filename or not os.path.isfile(filename):
             QtWidgets.QMessageBox.warning(self, "File Error", f"File not found:\n{filename}")
             return
         self._start_loader(filename)
 
     def set_data(self, data):
+        detector_data = np.asarray(data)
+        if detector_data.ndim != 2:
+            raise ValueError("OSC data must be a 2D array.")
+        self.detector_data = detector_data
+        self.angle_space_result = None
+        self.angle_space_cake = None
+
+        detector_height, detector_width = self.detector_data.shape
+        self.center_col_spin.setRange(-1_000_000.0, max(1_000_000.0, float(detector_width)))
+        self.center_row_spin.setRange(-1_000_000.0, max(1_000_000.0, float(detector_height)))
+        self.radial_bins_spin.setValue(detector_width)
+        self.azimuth_bins_spin.setValue(detector_height)
+        self._set_beam_center(
+            (detector_height - 1) / 2.0,
+            (detector_width - 1) / 2.0,
+        )
+        self.show_detector_view()
+
+    def _set_display_data(self, data, x_coords, y_coords, x_label, y_label):
         self.data = np.asarray(data)
         if self.data.ndim != 2:
-            raise ValueError("OSC data must be a 2D array.")
+            raise ValueError("Display data must be a 2D array.")
 
         self.height, self.width = self.data.shape
+        self.display_x_full = np.asarray(x_coords, dtype=np.float64)
+        self.display_y_full = np.asarray(y_coords, dtype=np.float64)
+        if self.display_x_full.size != self.width or self.display_y_full.size != self.height:
+            raise ValueError("Coordinate vectors must match the display data shape.")
+        self.display_x_edges = self._coord_edges(self.display_x_full)
+        self.display_y_edges = self._coord_edges(self.display_y_full)
+        self.display_x_label = x_label
+        self.display_y_label = y_label
         self.data_min, self.data_max = self._estimate_data_stats()
 
         self.prepare_profile_cache()
 
+        self.image_plot.setLabel("bottom", self.display_x_label)
+        self.image_plot.setLabel("left", self.display_y_label)
         self.image_item.setImage(self.data, autoLevels=False)
-        self.image_item.setRect(QtCore.QRectF(0, 0, self.width, self.height))
+        self.image_item.setRect(
+            QtCore.QRectF(
+                float(self.display_x_edges[0]),
+                float(self.display_y_edges[0]),
+                float(self.display_x_edges[-1] - self.display_x_edges[0]),
+                float(self.display_y_edges[-1] - self.display_y_edges[0]),
+            )
+        )
 
         slider_low = min(0.0, self.data_min)
         slider_high = self.data_max
@@ -343,8 +711,17 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.image_item.setLevels((vmin_default, vmax_default))
         self.hist_lut.setLevels(vmin_default, vmax_default)
 
-        self.image_plot.setLimits(xMin=0, xMax=self.width, yMin=0, yMax=self.height)
-        self.image_view.setRange(xRange=(0, self.width), yRange=(0, self.height), padding=0.0)
+        self.image_plot.setLimits(
+            xMin=float(self.display_x_edges[0]),
+            xMax=float(self.display_x_edges[-1]),
+            yMin=float(self.display_y_edges[0]),
+            yMax=float(self.display_y_edges[-1]),
+        )
+        self.image_view.setRange(
+            xRange=(float(self.display_x_edges[0]), float(self.display_x_edges[-1])),
+            yRange=(float(self.display_y_edges[0]), float(self.display_y_edges[-1])),
+            padding=0.0,
+        )
 
         low, high = self._safe_limits_linear(self.data_min, self.data_max)
         self.bottom_plot.setYRange(low, high, padding=0.02)
@@ -355,14 +732,46 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.last_iy = None
         self.last_bottom_range = (None, None)
         self.last_left_range = (None, None)
+        self._update_beam_center_marker()
         self.update_cursor(self.width // 2, self.height // 2, force=True)
+        self._set_interaction_enabled(True)
+
+    def show_detector_view(self):
+        if self.detector_data is None:
+            return
+        self.current_view_mode = "detector"
+        self.pick_center_button.blockSignals(True)
+        self.pick_center_button.setChecked(False)
+        self.pick_center_button.blockSignals(False)
+        x_coords = np.arange(self.detector_data.shape[1], dtype=np.float64)
+        y_coords = np.arange(self.detector_data.shape[0], dtype=np.float64)
+        self._set_display_data(
+            self.detector_data,
+            x_coords,
+            y_coords,
+            "X pixels",
+            "Y pixels",
+        )
+
+    def show_angle_space_view(self, cake, radial_deg, phi_deg):
+        self.current_view_mode = "angle_space"
+        self.pick_center_button.blockSignals(True)
+        self.pick_center_button.setChecked(False)
+        self.pick_center_button.blockSignals(False)
+        self._set_display_data(
+            cake,
+            radial_deg,
+            phi_deg,
+            "2θ (degrees)",
+            "φ (degrees)",
+        )
 
     def prepare_profile_cache(self):
         self.step_x = max(1, self.width // self.MAX_PROFILE_POINTS)
         self.step_y = max(1, self.height // self.MAX_PROFILE_POINTS)
 
-        self.x_profile_coords = np.arange(0, self.width, self.step_x, dtype=np.float32)
-        self.y_profile_coords = np.arange(0, self.height, self.step_y, dtype=np.float32)
+        self.x_profile_coords = self.display_x_full[::self.step_x].astype(np.float32, copy=False)
+        self.y_profile_coords = self.display_y_full[::self.step_y].astype(np.float32, copy=False)
 
     def _positive_only(self, values):
         clipped = np.asarray(values, dtype=np.float64)
@@ -407,7 +816,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         mouse_point = self.image_view.mapSceneToView(position)
         x_data = float(mouse_point.x())
         y_data = float(mouse_point.y())
-        if 0 <= x_data < self.width and 0 <= y_data < self.height:
+        if (
+            self.display_x_edges[0] <= x_data <= self.display_x_edges[-1]
+            and self.display_y_edges[0] <= y_data <= self.display_y_edges[-1]
+        ):
             self.pending_x = x_data
             self.pending_y = y_data
             self.pending_dirty = True
@@ -424,8 +836,15 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             return
 
         mouse_point = self.image_view.mapSceneToView(position)
-        self.pending_x = float(mouse_point.x())
-        self.pending_y = float(mouse_point.y())
+        x_data = float(mouse_point.x())
+        y_data = float(mouse_point.y())
+        if self.current_view_mode == "detector" and self.pick_center_button.isChecked():
+            self._set_beam_center(y_data, x_data)
+            self.pick_center_button.blockSignals(True)
+            self.pick_center_button.setChecked(False)
+            self.pick_center_button.blockSignals(False)
+        self.pending_x = x_data
+        self.pending_y = y_data
         self.pending_dirty = True
         self.render_pending_cursor()
 
@@ -433,8 +852,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if self.data is None or not self.pending_dirty:
             return
 
-        ix = int(np.clip(self.pending_x, 0, self.width - 1))
-        iy = int(np.clip(self.pending_y, 0, self.height - 1))
+        ix = self._index_from_edges(self.pending_x, self.display_x_edges)
+        iy = self._index_from_edges(self.pending_y, self.display_y_edges)
         self.pending_dirty = False
         self.update_cursor(ix, iy)
 
@@ -445,9 +864,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             return
 
         intensity = float(self.data[iy, ix])
+        x_value = float(self.display_x_full[ix])
+        y_value = float(self.display_y_full[iy])
 
-        self.v_line.setPos(ix)
-        self.h_line.setPos(iy)
+        self.v_line.setPos(x_value)
+        self.h_line.setPos(y_value)
 
         row_profile = self.data[iy, ::self.step_x]
         col_profile = self.data[::self.step_y, ix]
@@ -468,8 +889,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
         self.bottom_curve.setData(self.x_profile_coords, row_plot)
         self.left_curve.setData(col_plot, self.y_profile_coords)
-        self.bottom_marker.setData([ix], [bottom_marker_y])
-        self.left_marker.setData([left_marker_x], [iy])
+        self.bottom_marker.setData([x_value], [bottom_marker_y])
+        self.left_marker.setData([left_marker_x], [y_value])
 
         x_start_idx, x_end_idx, y_start_idx, y_end_idx = self._profile_visible_slice()
         visible_row = row_profile[x_start_idx:x_end_idx]
@@ -500,7 +921,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
         self.info_label.setText(
             "Left-click+drag: zoom | Move mouse: inspect | "
-            f"X: {ix}  Y: {iy}  Intensity: {intensity:.0f}"
+            f"{self.display_x_label}: {self._x_text(ix)}  "
+            f"{self.display_y_label}: {self._y_text(iy)}  "
+            f"Intensity: {intensity:.0f}  "
+            f"{self._beam_center_summary()}"
         )
 
         self.last_ix = ix
@@ -509,7 +933,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def reset_zoom(self):
         if self.data is None:
             return
-        self.image_view.setRange(xRange=(0, self.width), yRange=(0, self.height), padding=0.0)
+        self.image_view.setRange(
+            xRange=(float(self.display_x_edges[0]), float(self.display_x_edges[-1])),
+            yRange=(float(self.display_y_edges[0]), float(self.display_y_edges[-1])),
+            padding=0.0,
+        )
 
     def save_current_view(self):
         if self.data is None:
