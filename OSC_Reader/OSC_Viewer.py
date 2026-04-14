@@ -16,7 +16,7 @@ from .angle_space import (
     prepare_gui_phi_display,
     warm_angle_space_engine,
 )
-from .OSC_Reader import read_osc
+from .image_import import get_detector_file_dialog_filter, read_detector_image
 
 try:
     import pyqtgraph as pg
@@ -36,6 +36,30 @@ else:  # pragma: no cover - Qt missing
     _QtSignal = None
 
 
+if QtCore is not None:
+    try:
+        _QtDownArrow = QtCore.Qt.ArrowType.DownArrow
+        _QtRightArrow = QtCore.Qt.ArrowType.RightArrow
+    except AttributeError:  # pragma: no cover - Qt5 fallback
+        _QtDownArrow = QtCore.Qt.DownArrow
+        _QtRightArrow = QtCore.Qt.RightArrow
+
+    try:
+        _QtToolButtonTextBesideIcon = QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+    except AttributeError:  # pragma: no cover - Qt5 fallback
+        _QtToolButtonTextBesideIcon = QtCore.Qt.ToolButtonTextBesideIcon
+
+    try:
+        _QtPointingHandCursor = QtCore.Qt.CursorShape.PointingHandCursor
+    except AttributeError:  # pragma: no cover - Qt5 fallback
+        _QtPointingHandCursor = QtCore.Qt.PointingHandCursor
+else:  # pragma: no cover - Qt missing
+    _QtDownArrow = None
+    _QtRightArrow = None
+    _QtToolButtonTextBesideIcon = None
+    _QtPointingHandCursor = None
+
+
 if QtCore is not None and _QtSignal is not None:
     class _OSCLoadWorker(QtCore.QObject):
         loaded = _QtSignal(str, object)
@@ -48,7 +72,7 @@ if QtCore is not None and _QtSignal is not None:
 
         def run(self):
             try:
-                data = read_osc(self.filename)
+                data = read_detector_image(self.filename)
             except Exception as exc:  # pragma: no cover - read error path
                 self.failed.emit(self.filename, str(exc))
             else:
@@ -102,6 +126,48 @@ if QtCore is not None and _QtSignal is not None:
                 self.finished.emit()
 
 
+if QtWidgets is not None:
+    class _CollapsibleSection(QtWidgets.QFrame):
+        def __init__(self, title, *, expanded=True, parent=None):
+            super().__init__(parent)
+            self.setObjectName("settingsSection")
+
+            root_layout = QtWidgets.QVBoxLayout(self)
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            self.toggle_button = QtWidgets.QToolButton(self)
+            self.toggle_button.setObjectName("sectionToggle")
+            self.toggle_button.setCheckable(True)
+            self.toggle_button.setChecked(bool(expanded))
+            self.toggle_button.setText(str(title))
+            if _QtToolButtonTextBesideIcon is not None:
+                self.toggle_button.setToolButtonStyle(_QtToolButtonTextBesideIcon)
+            if _QtPointingHandCursor is not None:
+                self.toggle_button.setCursor(_QtPointingHandCursor)
+            root_layout.addWidget(self.toggle_button)
+
+            self.body = QtWidgets.QWidget(self)
+            self.body.setObjectName("sectionBody")
+            self.body_layout = QtWidgets.QVBoxLayout(self.body)
+            self.body_layout.setContentsMargins(12, 4, 12, 12)
+            self.body_layout.setSpacing(10)
+            root_layout.addWidget(self.body)
+
+            self.toggle_button.toggled.connect(self.set_expanded)
+            self.set_expanded(expanded)
+
+        def set_expanded(self, expanded):
+            expanded = bool(expanded)
+            self.toggle_button.blockSignals(True)
+            self.toggle_button.setChecked(expanded)
+            self.toggle_button.blockSignals(False)
+            if _QtDownArrow is not None and _QtRightArrow is not None:
+                self.toggle_button.setArrowType(
+                    _QtDownArrow if expanded else _QtRightArrow
+                )
+            self.body.setVisible(expanded)
+
 class OSCViewerWindow(QtWidgets.QMainWindow):
     TARGET_FPS = 60.0
     MAX_PROFILE_POINTS = 800
@@ -111,6 +177,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def __init__(self, filename):
         super().__init__()
         self.setWindowTitle("OSC Reader (High FPS Viewer)")
+        self.resize(1680, 1020)
         self._apply_always_on_top()
 
         self.filename = None
@@ -275,39 +342,274 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             sample_max = float(np.max(self.data))
         return sample_min, sample_max
 
+    def _apply_window_style(self):
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background-color: #0f1115;
+                color: #edf2f7;
+            }
+            QLabel {
+                color: #edf2f7;
+            }
+            QFrame#toolbarGroup,
+            QFrame#settingsShelf {
+                background-color: #131923;
+                border: 1px solid #242b36;
+                border-radius: 12px;
+            }
+            QLabel#sectionCaption {
+                color: #97a6b7;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QLabel#fieldLabel {
+                color: #aeb9c6;
+            }
+            QPushButton#commandButton,
+            QToolButton#viewButton,
+            QToolButton#contextButton,
+            QToolButton#profileToggle {
+                background-color: #1b2330;
+                border: 1px solid #2c3644;
+                border-radius: 8px;
+                color: #f3f7fb;
+                padding: 6px 12px;
+            }
+            QPushButton#commandButton:hover,
+            QToolButton#viewButton:hover,
+            QToolButton#contextButton:hover,
+            QToolButton#profileToggle:hover {
+                background-color: #242e3d;
+                border-color: #3a4758;
+            }
+            QToolButton#viewButton:checked,
+            QToolButton#contextButton:checked,
+            QToolButton#profileToggle:checked {
+                background-color: #1f5f8b;
+                border-color: #67b4e5;
+                color: #ffffff;
+            }
+            QToolButton#sectionToggle {
+                background-color: transparent;
+                border: none;
+                color: #f3f7fb;
+                font-weight: 600;
+                padding: 10px 12px 6px 12px;
+                text-align: left;
+            }
+            QToolButton#sectionToggle:hover {
+                color: #9bd1f3;
+            }
+            QFrame#settingsSection {
+                background-color: #121720;
+                border: 1px solid #242b36;
+                border-radius: 12px;
+            }
+            QWidget#sectionBody {
+                background-color: transparent;
+                border: none;
+            }
+            QComboBox,
+            QSpinBox,
+            QDoubleSpinBox {
+                background-color: #0e131a;
+                border: 1px solid #2a3340;
+                border-radius: 7px;
+                color: #edf2f7;
+                min-height: 28px;
+                padding: 2px 8px;
+            }
+            QComboBox:focus,
+            QSpinBox:focus,
+            QDoubleSpinBox:focus {
+                border-color: #67b4e5;
+            }
+            QStatusBar {
+                background-color: #0c0f14;
+                border-top: 1px solid #1f2630;
+                color: #9fb0c1;
+            }
+            QStatusBar QLabel {
+                color: #9fb0c1;
+            }
+            """
+        )
+
+    def _make_caption_label(self, text):
+        label = QtWidgets.QLabel(str(text).upper())
+        label.setObjectName("sectionCaption")
+        return label
+
+    def _make_field_label(self, text):
+        label = QtWidgets.QLabel(str(text))
+        label.setObjectName("fieldLabel")
+        return label
+
+    def _make_action_button(self, text, *, tooltip=None, shortcut=None):
+        button = QtWidgets.QPushButton(str(text))
+        button.setObjectName("commandButton")
+        if tooltip:
+            button.setToolTip(str(tooltip))
+        if shortcut:
+            button.setShortcut(str(shortcut))
+        return button
+
+    def _make_tool_button(
+        self,
+        text,
+        *,
+        object_name,
+        checkable=False,
+        tooltip=None,
+        shortcut=None,
+        minimum_width=None,
+    ):
+        button = QtWidgets.QToolButton(self)
+        button.setText(str(text))
+        button.setObjectName(str(object_name))
+        button.setCheckable(bool(checkable))
+        if _QtPointingHandCursor is not None:
+            button.setCursor(_QtPointingHandCursor)
+        if tooltip:
+            button.setToolTip(str(tooltip))
+        if shortcut:
+            button.setShortcut(str(shortcut))
+        if minimum_width is not None:
+            button.setMinimumWidth(int(minimum_width))
+        return button
+
+    def _create_toolbar_group(self, title):
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("toolbarGroup")
+        layout = QtWidgets.QVBoxLayout(frame)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+        layout.addWidget(self._make_caption_label(title))
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        layout.addLayout(row)
+        return frame, row
+
+    def _add_labeled_field(self, layout, row, column, label_text, widget):
+        layout.addWidget(self._make_field_label(label_text), row, column)
+        layout.addWidget(widget, row, column + 1)
+
+    def _set_status_message(self, message):
+        self.statusBar().showMessage(str(message))
+
+    def _sync_view_controls(self):
+        button_map = {
+            "detector": self.detector_view_button,
+            "angle_space": self.angle_space_view_button,
+        }
+        active_mode = self.current_view_mode if self.current_view_mode in button_map else "detector"
+        for mode, button in button_map.items():
+            button.blockSignals(True)
+            button.setChecked(mode == active_mode)
+            button.blockSignals(False)
+
+        pick_visible = self.detector_data is not None and self.current_view_mode == "detector"
+        self.pick_center_button.setVisible(pick_visible)
+        self.context_tools_frame.setVisible(pick_visible)
+        self.status_view_label.setText(
+            {
+                "detector": "View: Detector",
+                "angle_space": "View: φ/2θ",
+            }.get(self.current_view_mode, "View: Detector")
+        )
+
+    def _request_view_mode(self, view_mode):
+        if self._loading or self._converting or self.detector_data is None:
+            self._sync_view_controls()
+            return
+
+        view_mode = str(view_mode)
+        if view_mode == "detector":
+            self.show_detector_view()
+            return
+        if view_mode == "angle_space":
+            if self.angle_space_result is not None:
+                self._update_angle_space_display(force_show=True)
+                return
+            self.convert_active_image()
+
     def _build_ui(self):
         pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
+        self._apply_window_style()
 
         central = QtWidgets.QWidget()
         main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(14, 14, 14, 8)
+        main_layout.setSpacing(10)
         self.setCentralWidget(central)
 
-        controls_layout = QtWidgets.QHBoxLayout()
-        self.open_button = QtWidgets.QPushButton("Open OSC")
-        self.save_button = QtWidgets.QPushButton("Save Image")
-        self.reset_button = QtWidgets.QPushButton("Reset Zoom")
-        self.show_detector_button = QtWidgets.QPushButton("Show Detector")
-        self.pick_center_button = QtWidgets.QPushButton("Pick Beam Center")
-        self.convert_button = QtWidgets.QPushButton("Convert to φ/2θ")
-        self.bottom_log_button = QtWidgets.QPushButton("Bottom Log Y")
-        self.left_log_button = QtWidgets.QPushButton("Side Log X")
-        self.pick_center_button.setCheckable(True)
-        self.bottom_log_button.setCheckable(True)
-        self.left_log_button.setCheckable(True)
-        fps_label = QtWidgets.QLabel(f"Render target: {int(self.TARGET_FPS)} FPS")
-        controls_layout.addWidget(self.open_button)
-        controls_layout.addWidget(self.save_button)
-        controls_layout.addWidget(self.reset_button)
-        controls_layout.addWidget(self.show_detector_button)
-        controls_layout.addWidget(self.pick_center_button)
-        controls_layout.addWidget(self.convert_button)
-        controls_layout.addWidget(self.bottom_log_button)
-        controls_layout.addWidget(self.left_log_button)
-        controls_layout.addStretch(1)
-        controls_layout.addWidget(fps_label)
-        main_layout.addLayout(controls_layout)
+        top_bar = QtWidgets.QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.setSpacing(10)
 
-        geometry_layout = QtWidgets.QHBoxLayout()
+        file_group, file_row = self._create_toolbar_group("File")
+        self.open_button = self._make_action_button(
+            "Open Image",
+            tooltip="Open a detector image. (Ctrl+O)",
+            shortcut="Ctrl+O",
+        )
+        self.save_button = self._make_action_button(
+            "Save Image",
+            tooltip="Save the current main image view. (Ctrl+S)",
+            shortcut="Ctrl+S",
+        )
+        self.reset_button = self._make_action_button(
+            "Reset View",
+            tooltip="Reset the zoom to the full image extent. (R)",
+            shortcut="R",
+        )
+        file_row.addWidget(self.open_button)
+        file_row.addWidget(self.save_button)
+        file_row.addWidget(self.reset_button)
+
+        view_group, view_row = self._create_toolbar_group("View")
+        self.detector_view_button = self._make_tool_button(
+            "Detector",
+            object_name="viewButton",
+            checkable=True,
+            tooltip="Show the raw detector pixel view. (Ctrl+1)",
+            shortcut="Ctrl+1",
+            minimum_width=102,
+        )
+        self.angle_space_view_button = self._make_tool_button(
+            "φ/2θ",
+            object_name="viewButton",
+            checkable=True,
+            tooltip="Show the angle-space conversion, creating it if needed. (Ctrl+2)",
+            shortcut="Ctrl+2",
+            minimum_width=86,
+        )
+        self.view_button_group = QtWidgets.QButtonGroup(self)
+        self.view_button_group.setExclusive(True)
+        self.view_button_group.addButton(self.detector_view_button)
+        self.view_button_group.addButton(self.angle_space_view_button)
+        self.detector_view_button.setChecked(True)
+        view_row.addWidget(self.detector_view_button)
+        view_row.addWidget(self.angle_space_view_button)
+
+        self.context_tools_frame, tools_row = self._create_toolbar_group("Tools")
+        self.pick_center_button = self._make_tool_button(
+            "Pick Beam Center",
+            object_name="contextButton",
+            checkable=True,
+            tooltip="Click the detector image to place the beam center. (B)",
+            shortcut="B",
+            minimum_width=148,
+        )
+        tools_row.addWidget(self.pick_center_button)
+
+        top_bar.addWidget(file_group)
+        top_bar.addWidget(view_group)
+        top_bar.addWidget(self.context_tools_frame)
+        top_bar.addStretch(1)
+        main_layout.addLayout(top_bar)
 
         self.center_col_spin = QtWidgets.QDoubleSpinBox()
         self.center_row_spin = QtWidgets.QDoubleSpinBox()
@@ -321,50 +623,99 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             spin.setDecimals(2)
             spin.setRange(-1_000_000.0, 1_000_000.0)
             spin.setSingleStep(1.0)
+            spin.setMinimumWidth(132)
 
         self.distance_spin.setDecimals(4)
         self.distance_spin.setRange(0.0001, 1_000_000.0)
         self.distance_spin.setSingleStep(0.1)
         self.distance_spin.setSuffix(" mm")
         self.distance_spin.setValue(75.0)
+        self.distance_spin.setMinimumWidth(132)
 
         self.pixel_size_spin.setDecimals(5)
         self.pixel_size_spin.setRange(0.00001, 1000.0)
         self.pixel_size_spin.setSingleStep(0.001)
         self.pixel_size_spin.setSuffix(" mm")
         self.pixel_size_spin.setValue(0.1)
+        self.pixel_size_spin.setMinimumWidth(132)
 
         for spin in (self.radial_bins_spin, self.azimuth_bins_spin):
             spin.setRange(2, 10000)
             spin.setSingleStep(10)
+            spin.setMinimumWidth(132)
         self.radial_bins_spin.setValue(1000)
         self.azimuth_bins_spin.setValue(720)
+
+        self.phi_zero_direction_combo.setMinimumWidth(132)
+        self.phi_zero_direction_combo.setToolTip(
+            "Choose which detector direction is treated as φ = 0 during φ/2θ conversion."
+        )
         for direction in PHI_ZERO_DIRECTIONS:
             self.phi_zero_direction_combo.addItem(direction.title())
         self.phi_zero_direction_combo.setCurrentText(DEFAULT_PHI_ZERO_DIRECTION.title())
 
-        geometry_layout.addWidget(QtWidgets.QLabel("Center X"))
-        geometry_layout.addWidget(self.center_col_spin)
-        geometry_layout.addWidget(QtWidgets.QLabel("Center Y"))
-        geometry_layout.addWidget(self.center_row_spin)
-        geometry_layout.addWidget(QtWidgets.QLabel("Distance"))
-        geometry_layout.addWidget(self.distance_spin)
-        geometry_layout.addWidget(QtWidgets.QLabel("Pixel Size"))
-        geometry_layout.addWidget(self.pixel_size_spin)
-        geometry_layout.addWidget(QtWidgets.QLabel("2θ Bins"))
-        geometry_layout.addWidget(self.radial_bins_spin)
-        geometry_layout.addWidget(QtWidgets.QLabel("φ Bins"))
-        geometry_layout.addWidget(self.azimuth_bins_spin)
-        geometry_layout.addWidget(QtWidgets.QLabel("φ=0 At"))
-        geometry_layout.addWidget(self.phi_zero_direction_combo)
-        geometry_layout.addStretch(1)
-        main_layout.addLayout(geometry_layout)
+        self.bottom_log_button = self._make_tool_button(
+            "Bottom Profile Log Y",
+            object_name="profileToggle",
+            checkable=True,
+            tooltip="Use a log Y axis for the bottom profile.",
+        )
+        self.left_log_button = self._make_tool_button(
+            "Side Profile Log X",
+            object_name="profileToggle",
+            checkable=True,
+            tooltip="Use a log X axis for the side profile.",
+        )
+
+        settings_shelf = QtWidgets.QFrame()
+        settings_shelf.setObjectName("settingsShelf")
+        settings_layout = QtWidgets.QHBoxLayout(settings_shelf)
+        settings_layout.setContentsMargins(12, 10, 12, 10)
+        settings_layout.setSpacing(10)
+
+        self.geometry_section = _CollapsibleSection("Geometry", expanded=True)
+        geometry_widget = QtWidgets.QWidget()
+        geometry_grid = QtWidgets.QGridLayout(geometry_widget)
+        geometry_grid.setContentsMargins(0, 0, 0, 0)
+        geometry_grid.setHorizontalSpacing(12)
+        geometry_grid.setVerticalSpacing(8)
+        self._add_labeled_field(geometry_grid, 0, 0, "Center X (px)", self.center_col_spin)
+        self._add_labeled_field(geometry_grid, 0, 2, "Center Y (px)", self.center_row_spin)
+        self._add_labeled_field(geometry_grid, 1, 0, "Distance", self.distance_spin)
+        self._add_labeled_field(geometry_grid, 1, 2, "Pixel Size", self.pixel_size_spin)
+        self._add_labeled_field(geometry_grid, 2, 0, "φ Zero Direction", self.phi_zero_direction_combo)
+        self.geometry_section.body_layout.addWidget(geometry_widget)
+
+        self.sampling_section = _CollapsibleSection("Sampling", expanded=False)
+        sampling_widget = QtWidgets.QWidget()
+        sampling_grid = QtWidgets.QGridLayout(sampling_widget)
+        sampling_grid.setContentsMargins(0, 0, 0, 0)
+        sampling_grid.setHorizontalSpacing(12)
+        sampling_grid.setVerticalSpacing(8)
+        self._add_labeled_field(sampling_grid, 0, 0, "2θ Bins", self.radial_bins_spin)
+        self._add_labeled_field(sampling_grid, 1, 0, "φ Bins", self.azimuth_bins_spin)
+        self.sampling_section.body_layout.addWidget(sampling_widget)
+
+        self.profiles_section = _CollapsibleSection("Profiles", expanded=False)
+        profiles_widget = QtWidgets.QWidget()
+        profiles_layout = QtWidgets.QVBoxLayout(profiles_widget)
+        profiles_layout.setContentsMargins(0, 0, 0, 0)
+        profiles_layout.setSpacing(8)
+        profiles_layout.addWidget(self.bottom_log_button)
+        profiles_layout.addWidget(self.left_log_button)
+        profiles_layout.addStretch(1)
+        self.profiles_section.body_layout.addWidget(profiles_widget)
+
+        settings_layout.addWidget(self.geometry_section, 2)
+        settings_layout.addWidget(self.sampling_section, 1)
+        settings_layout.addWidget(self.profiles_section, 1)
+        main_layout.addWidget(settings_shelf)
 
         self.graphics = pg.GraphicsLayoutWidget()
         self.graphics.ci.layout.setColumnStretchFactor(0, 1)
-        self.graphics.ci.layout.setColumnStretchFactor(1, 4)
+        self.graphics.ci.layout.setColumnStretchFactor(1, 5)
         self.graphics.ci.layout.setColumnStretchFactor(2, 1)
-        self.graphics.ci.layout.setRowStretchFactor(0, 4)
+        self.graphics.ci.layout.setRowStretchFactor(0, 5)
         self.graphics.ci.layout.setRowStretchFactor(1, 1)
         main_layout.addWidget(self.graphics, 1)
 
@@ -419,15 +770,22 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.bottom_plot.addItem(self.bottom_marker)
         self.left_plot.addItem(self.left_marker)
 
-        self.info_label = QtWidgets.QLabel("Left-click+drag: zoom | Move mouse: inspect")
-        main_layout.addWidget(self.info_label)
+        self.status_view_label = QtWidgets.QLabel("View: Detector")
+        self.status_fps_label = QtWidgets.QLabel(f"Render Target: {int(self.TARGET_FPS)} FPS")
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().addPermanentWidget(self.status_view_label)
+        self.statusBar().addPermanentWidget(self.status_fps_label)
 
         self.open_button.clicked.connect(self.open_file_dialog)
         self.save_button.clicked.connect(self.save_current_view)
         self.reset_button.clicked.connect(self.reset_zoom)
-        self.show_detector_button.clicked.connect(self.show_detector_view)
+        self.detector_view_button.clicked.connect(
+            lambda checked: self._request_view_mode("detector") if checked else None
+        )
+        self.angle_space_view_button.clicked.connect(
+            lambda checked: self._request_view_mode("angle_space") if checked else None
+        )
         self.pick_center_button.toggled.connect(self._on_pick_center_toggled)
-        self.convert_button.clicked.connect(self.convert_active_image)
         self.bottom_log_button.toggled.connect(self.set_bottom_log_mode)
         self.left_log_button.toggled.connect(self.set_left_log_mode)
         self.center_col_spin.valueChanged.connect(self._on_beam_center_spin_changed)
@@ -449,22 +807,26 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.refresh_timer.timeout.connect(self.render_pending_cursor)
         self.refresh_timer.start()
         self._set_interaction_enabled(False)
+        self._set_status_message("Open a detector image to begin.")
 
     def _set_interaction_enabled(self, enabled):
-        self.save_button.setEnabled(enabled)
-        self.reset_button.setEnabled(enabled)
-        self.show_detector_button.setEnabled(enabled and self.detector_data is not None)
-        self.pick_center_button.setEnabled(enabled and self.current_view_mode == "detector")
-        self.convert_button.setEnabled(enabled and self.detector_data is not None)
-        self.bottom_log_button.setEnabled(enabled)
-        self.left_log_button.setEnabled(enabled)
-        self.center_col_spin.setEnabled(enabled and self.detector_data is not None)
-        self.center_row_spin.setEnabled(enabled and self.detector_data is not None)
-        self.distance_spin.setEnabled(enabled and self.detector_data is not None)
-        self.pixel_size_spin.setEnabled(enabled and self.detector_data is not None)
-        self.radial_bins_spin.setEnabled(enabled and self.detector_data is not None)
-        self.azimuth_bins_spin.setEnabled(enabled and self.detector_data is not None)
-        self.phi_zero_direction_combo.setEnabled(enabled and self.detector_data is not None)
+        has_detector = enabled and self.detector_data is not None
+        has_display = enabled and self.data is not None
+        self.save_button.setEnabled(has_display)
+        self.reset_button.setEnabled(has_display)
+        self.detector_view_button.setEnabled(has_detector)
+        self.angle_space_view_button.setEnabled(has_detector)
+        self.pick_center_button.setEnabled(has_detector and self.current_view_mode == "detector")
+        self.bottom_log_button.setEnabled(has_display)
+        self.left_log_button.setEnabled(has_display)
+        self.center_col_spin.setEnabled(has_detector)
+        self.center_row_spin.setEnabled(has_detector)
+        self.distance_spin.setEnabled(has_detector)
+        self.pixel_size_spin.setEnabled(has_detector)
+        self.radial_bins_spin.setEnabled(has_detector)
+        self.azimuth_bins_spin.setEnabled(has_detector)
+        self.phi_zero_direction_combo.setEnabled(has_detector)
+        self._sync_view_controls()
 
     def _set_beam_center(self, row, col, update_spins=True):
         if self.detector_data is not None:
@@ -511,7 +873,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.pick_center_button.blockSignals(False)
             return
         if enabled:
-            self.info_label.setText(
+            self._set_status_message(
                 "Click the detector image to place the beam center. The click snaps to the nearest peak top."
             )
         elif self.data is not None:
@@ -653,7 +1015,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._converting = True
         self.open_button.setEnabled(False)
         self._set_interaction_enabled(False)
-        self.info_label.setText(
+        self._set_status_message(
             f"Converting to φ/2θ with {DEFAULT_ANGLE_SPACE_WORKERS} workers ..."
         )
 
@@ -689,7 +1051,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             f"Failed to convert the active image to φ/2θ space.\n\n{message}",
         )
         if self.data is not None:
-            self.info_label.setText(
+            self._set_status_message(
                 "Conversion failed. Adjust the geometry and try again."
             )
 
@@ -709,7 +1071,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if "_OSCLoadWorker" not in globals():
             # Fallback path if Qt signal bindings are unavailable.
             try:
-                data = read_osc(filename)
+                data = read_detector_image(filename)
             except Exception as exc:  # pragma: no cover - fallback error path
                 self._on_loader_failed(filename, str(exc))
             else:
@@ -720,7 +1082,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._loading = True
         self.open_button.setEnabled(False)
         self._set_interaction_enabled(False)
-        self.info_label.setText(f"Loading: {Path(filename).name} ...")
+        self._set_status_message(f"Loading: {Path(filename).name} ...")
 
         self._loader_thread = QtCore.QThread(self)
         self._loader_worker = _OSCLoadWorker(filename)
@@ -745,7 +1107,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
     def _on_loader_failed(self, filename, message):
         QtWidgets.QMessageBox.critical(self, "Load Error", f"Failed to read:\n{filename}\n\n{message}")
-        self.info_label.setText("Load failed. Choose another file with Open OSC.")
+        self._set_status_message("Load failed. Choose another detector image with Open Image.")
 
     def _on_loader_finished(self):
         self._loading = False
@@ -760,9 +1122,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         start_dir = str(Path(self.filename).parent) if self.filename else str(Path.cwd())
         selected, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Select an OSC file",
+            "Select a detector image",
             start_dir,
-            "OSC files (*.osc);;All files (*)",
+            get_detector_file_dialog_filter(),
         )
         if selected:
             self.load_file(selected)
@@ -778,7 +1140,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def set_data(self, data):
         detector_data = np.asarray(data)
         if detector_data.ndim != 2:
-            raise ValueError("OSC data must be a 2D array.")
+            raise ValueError("Detector data must be a 2D array.")
         self.detector_data = detector_data
         self.angle_space_result = None
         self.angle_space_cake = None
@@ -1059,7 +1421,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.left_plot.setXRange(col_low, col_high, padding=0.02)
             self.last_left_range = (col_low, col_high)
 
-        self.info_label.setText(
+        self._set_status_message(
             "Left-click+drag: zoom | Move mouse: inspect | "
             f"{self.display_x_label}: {self._x_text(ix)}  "
             f"{self.display_y_label}: {self._y_text(iy)}  "
@@ -1112,13 +1474,13 @@ def _require_qt_viewer_stack():
         )
 
 
-def visualize_osc_data(filename=None):
-    """Visualizes an OSC file in a high-FPS Qt viewer.
+def visualize_detector_data(filename=None):
+    """Visualize a detector image in the high-FPS Qt viewer.
 
     Parameters
     ----------
     filename : str | None
-        The path to the OSC file. If omitted, a file picker is shown.
+        The path to the detector image. If omitted, a file picker is shown.
     """
     _require_qt_viewer_stack()
 
@@ -1129,13 +1491,13 @@ def visualize_osc_data(filename=None):
     if filename is None:
         selected, _ = QtWidgets.QFileDialog.getOpenFileName(
             None,
-            "Select an OSC file",
+            "Select a detector image",
             str(Path.cwd()),
-            "OSC files (*.osc);;All files (*)",
+            get_detector_file_dialog_filter(),
         )
         filename = selected
         if not filename:
-            print("No OSC file selected.")
+            print("No detector image selected.")
             return
 
     if not os.path.isfile(filename):
@@ -1153,14 +1515,19 @@ def visualize_osc_data(filename=None):
             _ACTIVE_WINDOWS.remove(window)
 
 
+def visualize_osc_data(filename=None):
+    """Backwards-compatible alias for :func:`visualize_detector_data`."""
+    return visualize_detector_data(filename)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualize an OSC file.")
+    parser = argparse.ArgumentParser(description="Visualize a detector image.")
     parser.add_argument(
         "filename",
         nargs="?",
         default=None,
-        help="Optional path to the OSC file. If omitted, a file picker is shown.",
+        help="Optional path to the detector image. If omitted, a file picker is shown.",
     )
     args = parser.parse_args()
 
-    visualize_osc_data(args.filename)
+    visualize_detector_data(args.filename)

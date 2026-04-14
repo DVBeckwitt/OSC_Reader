@@ -14,13 +14,35 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Dict, Tuple
 
-from .OSC_Reader import ShapeError, convert_to_asc, osc2jpg, read_osc
+from .OSC_Reader import (
+    ShapeError,
+    convert_to_asc,
+    detector2jpg,
+    osc2jpg,
+    read_osc,
+)
+from .image_import import (
+    COMMON_DETECTOR_EXTENSIONS,
+    DetectorImageLoadResult,
+    get_detector_file_dialog_filter,
+    load_detector_image,
+    read_detector_image,
+    supported_detector_extensions,
+)
 
 __all__ = [
+    "COMMON_DETECTOR_EXTENSIONS",
+    "DetectorImageLoadResult",
     "ShapeError",
     "convert_to_asc",
+    "detector2jpg",
+    "get_detector_file_dialog_filter",
+    "load_detector_image",
     "osc2jpg",
+    "read_detector_image",
     "read_osc",
+    "supported_detector_extensions",
+    "visualize_detector_data",
     "visualize_osc_data",
 ]
 
@@ -106,6 +128,11 @@ def _load_optional_module(module_name: str):
 def __getattr__(name: str):
     """Lazily expose optional modules and symbols."""
     if name == "visualize_osc_data":
+        module = import_module(".OSC_Viewer", __name__)
+        attr = getattr(module, name)
+        globals()[name] = attr
+        return attr
+    if name == "visualize_detector_data":
         module = import_module(".OSC_Viewer", __name__)
         attr = getattr(module, name)
         globals()[name] = attr

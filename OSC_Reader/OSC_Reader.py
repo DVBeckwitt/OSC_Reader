@@ -10,6 +10,8 @@ import cv2
 from os.path import splitext, exists
 import logging
 
+from .image_import import load_detector_image, read_detector_image
+
 class ShapeError(Exception):
     """An error encountered while attempting to slice and reshape the
        data to fit the file-specified dimensions."""
@@ -24,31 +26,63 @@ _OPTIONAL_EXPORTS: Dict[str, Tuple[str, str]] = {
 }
 
 
-def osc2jpg(input_file):
-    # Read the OSC file into a numpy array
-    data = read_osc(input_file)
-    # Take the log of the data to enhance contrast
-    data = np.log(data)
-
-    # Normalize data to 0-255 for display as an 8-bit image
-    min_val, max_val = data.min(), data.max()
-    # If the image is uniform, handle that edge case
-    if min_val == max_val:
-        image_array = np.zeros_like(data, dtype=np.uint8)
+def _prepare_preview_image(data):
+    data = np.asarray(data, dtype=np.float64)
+    positive = data[data > 0]
+    if positive.size:
+        data = np.log(np.clip(data, np.min(positive), None))
     else:
-        image_array = (255 * (data - min_val) / (max_val - min_val)).astype(np.uint8)
+        data = np.zeros_like(data, dtype=np.float64)
+
+    min_val, max_val = data.min(), data.max()
+    if min_val == max_val:
+        return np.zeros_like(data, dtype=np.uint8)
+    return (255 * (data - min_val) / (max_val - min_val)).astype(np.uint8)
+
+
+def detector2jpg(input_file):
+    """Convert a detector image to a contrast-enhanced JPEG preview."""
+    data = read_detector_image(input_file)
+    image_array = _prepare_preview_image(data)
     output_file = f"{splitext(input_file)[0]}.jpg"
-    # Write the image to a JPG file
     cv2.imwrite(output_file, image_array)
     print(f"Converted {input_file} to {output_file}")
 
+
+def osc2jpg(input_file):
+    """Backwards-compatible alias for :func:`detector2jpg`."""
+    detector2jpg(input_file)
+
+
+def _asc_format_metadata(data):
+    finite = np.asarray(data)[np.isfinite(data)]
+    if finite.size == 0:
+        raise ValueError("Detector image contains no finite pixel values.")
+
+    integer_output = np.issubdtype(np.asarray(data).dtype, np.integer)
+    if integer_output:
+        width = max(len(str(int(np.min(finite)))), len(str(int(np.max(finite))))) + 1
+    else:
+        width = max(
+            len(f"{float(np.min(finite)):.8g}"),
+            len(f"{float(np.max(finite)):.8g}"),
+        ) + 1
+    return integer_output, width
+
+
+def _format_asc_value(value, integer_output, width):
+    if integer_output:
+        return f"{int(value):{width}d}"
+    return f"{float(value):{width}.8g}"
+
+
 def convert_to_asc(filename, force=False):
-    """Converts a RAXIS file to an ASCII grid file (.asc).
+    """Converts a detector image to an ASCII grid file (.asc).
 
     Parameters
     ----------
     filename : str
-        The filename of the RAXIS file to convert.
+        The filename of the detector image to convert.
     force : bool, optional
         Whether to overwrite an existing file of the same name.
         Default is False.
@@ -62,11 +96,7 @@ def convert_to_asc(filename, force=False):
         return
 
     try:
-        # Directly read raw bytes and interpret them using _interpret.
-        raw = np.fromfile(filename, dtype='u1')
-        if raw[:5].tobytes() != b'RAXIS':
-            raise IOError("This file doesn't seem to be a RAXIS file at all. Aborting!")
-        data = _interpret(raw)
+        data = read_detector_image(filename)
     except Exception as e:
         logging.error(f"Error reading {filename}: {e}")
         return
@@ -80,16 +110,19 @@ def convert_to_asc(filename, force=False):
             asc_file.write('Y starting pixel of ROI =          1\n')
             asc_file.write('ROI pixel values follow (X-direction changing fastest, bottom left first):\n')
 
-            max_val = data.max()
-            width = len(str(max_val)) + 1  # One space more than the largest number's length
-            # get the rows
+            integer_output, width = _asc_format_metadata(data)
             rows, cols = data.shape
             
             for row_idx in range(rows):
                 row_data = data[row_idx, :]
                 for start in range(0, cols, 10):
                     line_values = row_data[start:start+10]
-                    asc_file.write(''.join(f"{val:{width}d}" for val in line_values) + '\n')
+                    asc_file.write(
+                        ''.join(
+                            _format_asc_value(val, integer_output, width)
+                            for val in line_values
+                        ) + '\n'
+                    )
 
         print(f'Converted {filename} to {newfilename}')
     except Exception as e:
@@ -197,7 +230,10 @@ def __getattr__(name: str):
 __all__ = [
     "ShapeError",
     "convert_to_asc",
+    "detector2jpg",
+    "load_detector_image",
     "osc2jpg",
+    "read_detector_image",
     "read_osc",
     *_OPTIONAL_EXPORTS.keys(),
 ]

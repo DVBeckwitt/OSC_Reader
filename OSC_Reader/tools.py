@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-import fabio
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import numpy as np
@@ -11,7 +10,7 @@ import pandas as pd
 from scipy.ndimage import rotate
 from scipy.optimize import curve_fit
 
-from .OSC_Reader import read_osc
+from .image_import import load_detector_image, read_detector_image
 
 try:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -66,14 +65,14 @@ def _auto_alpha(sample_minus_dark: np.ndarray,
 def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
             title=None, show=True, vmin=0, log_intensity=False,
             save_img=None, high_res_dpi=600, substrate_scale=None):
-    """Plot a dark-subtracted OSC image with the beam center highlighted.
+    """Plot a dark-subtracted detector image with the beam center highlighted.
 
     Parameters
     ----------
     sample_path : str
-        Path to the sample ``.osc`` file.
+        Path to the sample detector image.
     dark_path : str
-        Path to the dark ``.osc`` file.
+        Path to the dark detector image.
     ai : :class:`pyFAI.integrator.azimuthal.AzimuthalIntegrator`
         Integrator containing calibration parameters.
     vmax : float, optional
@@ -102,17 +101,17 @@ def display(sample_path, ai, dark_path=None, substrate_path=None, vmax=200,
     numpy.ndarray
         The dark-subtracted image array.
     """
-    sample_image = read_osc(sample_path)
+    sample_image = read_detector_image(sample_path)
     sample_image = sample_image.astype(float, copy=False)
 
     if dark_path is not None:
-        dark_image  = read_osc(dark_path).astype(float, copy=False)
+        dark_image  = read_detector_image(dark_path).astype(float, copy=False)
         data        = sample_image - dark_image
     else:
         data = sample_image
 
     if substrate_path is not None:
-        substrate_image = read_osc(substrate_path).astype(float, copy=False)
+        substrate_image = read_detector_image(substrate_path).astype(float, copy=False)
 
         if substrate_scale is None:
             alpha = _auto_alpha(data, substrate_image)
@@ -311,15 +310,15 @@ def load_data(file_name):
     """Load an image from .npy or .asc format."""
     num_pixels_x, num_pixels_y = 3000, 3000
 
-    if file_name.endswith('.npy'):
+    suffix = Path(file_name).suffix.lower()
+
+    if suffix == '.npy':
         image = np.load(file_name)
         
         return np.flipud(image) 
-    elif file_name.endswith('.asc'):
+    if suffix == '.asc':
         return np.loadtxt(file_name, skiprows=6).reshape(num_pixels_y, num_pixels_x)
-
-    else:
-        raise ValueError("Unsupported file format")
+    raise ValueError("Unsupported file format")
     
 def image(d, c, gamma, file_name, orientation=None, rotate_angle=None, Gamma=0):
     """Correct image distortion and optionally rotate."""

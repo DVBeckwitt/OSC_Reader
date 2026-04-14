@@ -3,17 +3,20 @@
 ![OSC Reader viewer preview](docs/viewer_preview.png)
 
 `OSC_Reader` is a Python toolkit for working with Rigaku RAXIS `.osc` detector
-images. It combines a low-level file reader, export helpers, a high-FPS desktop
-viewer, an exact detector-to-angle-space conversion pipeline, and optional
-diffraction-analysis utilities that were folded in from the earlier
-`DVB_pack` work.
+images and other common 2D detector formats through a shared FabIO-backed
+import layer. It combines a low-level native `.osc` reader, generic import and
+export helpers, a high-FPS desktop viewer, an exact detector-to-angle-space
+conversion pipeline, and optional diffraction-analysis utilities that were
+folded in from the earlier `DVB_pack` work.
 
 The project is primarily a local scientific desktop tool and Python library. It
 is not a web service and does not require a deployment stack to be useful.
 
 ## Key Features
 
-- Read Rigaku RAXIS `.osc` files into NumPy arrays.
+- Read Rigaku RAXIS `.osc` files natively and open common detector formats such
+  as `.cbf`, `.edf`, `.img`, `.mccd`, `.sfrm`, `.gfrm`, `.tif`, `.tiff`,
+  `.h5`, `.hdf5`, and `.nxs` through FabIO.
 - Export detector frames to `.asc` text grids and `.jpg` images.
 - Inspect data in a PySide6/pyqtgraph GUI with crosshairs, linked line
   profiles, histogram/level controls, and zooming.
@@ -35,11 +38,12 @@ is not a web service and does not require a deployment stack to be useful.
 |----------|-------------|
 | Language | Python 3.8+ |
 | Core numeric layer | NumPy |
+| Detector import compatibility | FabIO |
 | Fast angle conversion | numba |
 | GUI | PySide6 + pyqtgraph |
 | Image export helper | OpenCV |
 | Packaging | setuptools |
-| Optional plotting/analysis | matplotlib, pandas, SciPy, pyFAI, fabio, lmfit, datashader |
+| Optional plotting/analysis | matplotlib, pandas, SciPy, pyFAI, lmfit, datashader |
 | Platform helpers | Windows batch launchers for local desktop use |
 
 ## Repository Layout
@@ -49,6 +53,7 @@ OSC_Reader/
 |-- OSC_Reader/
 |   |-- __init__.py          # Unified public package entry point with lazy exports
 |   |-- OSC_Reader.py        # Core .osc parser plus .asc/.jpg conversion helpers
+|   |-- image_import.py      # Shared detector-image loader with native .osc + FabIO fallback
 |   |-- OSC_Viewer.py        # Main Qt GUI / high-FPS desktop viewer
 |   |-- angle_space.py       # Exact detector-to-angle-space conversion pipeline
 |   |-- tools.py             # Optional diffraction utilities (pyFAI, plotting, etc.)
@@ -86,7 +91,6 @@ Install these only if you need the optional modules in `OSC_Reader.tools`,
 - `pandas`
 - `scipy`
 - `pyFAI`
-- `fabio`
 - `lmfit`
 - `datashader`
 
@@ -137,6 +141,7 @@ installs these core dependencies automatically:
 - `numpy`
 - `numba`
 - `tifffile`
+- `fabio`
 - `docopt`
 - `logbook`
 - `opencv-python`
@@ -149,7 +154,7 @@ If you need the optional diffraction-analysis modules, install their scientific
 stack separately:
 
 ```bash
-pip install matplotlib pandas scipy pyfai fabio lmfit datashader
+pip install matplotlib pandas scipy pyfai lmfit datashader
 ```
 
 ### 5. No environment variables are required
@@ -159,7 +164,7 @@ normal local usage.
 
 ## Getting Started
 
-### Read a detector image
+### Read a Rigaku `.osc` detector image
 
 ```python
 from OSC_Reader import read_osc
@@ -168,20 +173,33 @@ image = read_osc("example.osc")
 print(image.shape, image.dtype)
 ```
 
-### Convert an `.osc` file to `.asc`
+### Read any supported detector image
+
+```python
+from OSC_Reader import load_detector_image, read_detector_image
+
+result = load_detector_image("example.tif")
+print(result.format_name, result.loader_name, result.data.shape)
+
+image = read_detector_image("example.cbf")
+print(image.shape, image.dtype)
+```
+
+### Convert a detector image to `.asc`
 
 ```python
 from OSC_Reader import convert_to_asc
 
-convert_to_asc("example.osc")
+convert_to_asc("example.tif")
 ```
 
-### Convert an `.osc` file to `.jpg`
+### Convert a detector image to `.jpg`
 
 ```python
-from OSC_Reader import osc2jpg
+from OSC_Reader import detector2jpg, osc2jpg
 
-osc2jpg("example.osc")
+detector2jpg("example.tif")
+osc2jpg("example.osc")  # Backwards-compatible alias
 ```
 
 ### Launch the main GUI
@@ -189,7 +207,7 @@ osc2jpg("example.osc")
 Open a specific file:
 
 ```bash
-python -m OSC_Reader.OSC_Viewer path/to/example.osc
+python -m OSC_Reader.OSC_Viewer path/to/example.tif
 ```
 
 Open the viewer and choose a file from the dialog:
