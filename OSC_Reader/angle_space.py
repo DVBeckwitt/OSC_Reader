@@ -68,6 +68,13 @@ class DetectorCakeResult:
     count: np.ndarray
 
 
+@dataclass(frozen=True)
+class QSpaceResult:
+    qr: np.ndarray
+    qz: np.ndarray
+    intensity: np.ndarray
+
+
 def _default_worker_count() -> int:
     return max(
         1,
@@ -1263,6 +1270,109 @@ def prepare_gui_phi_display(
     return cake[mask, :], np.asarray(result.radial_deg, dtype=np.float64), gui_phi[mask]
 
 
+def convert_phi_2theta_to_qr_qz_space(
+    intensity: np.ndarray,
+    radial_deg: np.ndarray,
+    phi_deg: np.ndarray,
+    *,
+    wavelength_angstrom: float = 1.5406,
+    incident_angle_deg: float = 0.0,
+    qr_bins: int | None = None,
+    qz_bins: int | None = None,
+) -> QSpaceResult:
+    cake = np.asarray(intensity, dtype=np.float64)
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    phi = np.asarray(phi_deg, dtype=np.float64)
+
+    if cake.ndim != 2:
+        raise ValueError("intensity must be a 2D array.")
+    if radial.ndim != 1 or phi.ndim != 1:
+        raise ValueError("radial_deg and phi_deg must be 1D arrays.")
+    if cake.shape != (phi.size, radial.size):
+        raise ValueError("intensity shape must match (len(phi_deg), len(radial_deg)).")
+
+    qr_bins = int(radial.size if qr_bins is None else qr_bins)
+    qz_bins = int(phi.size if qz_bins is None else qz_bins)
+    if qr_bins < 2 or qz_bins < 2:
+        raise ValueError("qr_bins and qz_bins must be at least 2.")
+
+    wavelength = float(wavelength_angstrom)
+    if wavelength <= 0.0:
+        raise ValueError("wavelength_angstrom must be positive.")
+
+    phi_rad = np.deg2rad(phi)[:, None]
+    theta_rad = np.deg2rad(radial)[None, :]
+
+    sin_phi = np.sin(phi_rad)
+    cos_phi = np.cos(phi_rad)
+    sin_theta = np.sin(theta_rad)
+    cos_theta = np.cos(theta_rad)
+
+    wavevector = (2.0 * np.pi) / wavelength
+    incident_rad = np.deg2rad(float(incident_angle_deg))
+    sin_incident = np.sin(incident_rad)
+    cos_incident = np.cos(incident_rad)
+
+    delta_cos = cos_theta - 1.0
+    sin_theta_cos_phi = sin_theta * cos_phi
+    qy = (cos_incident * delta_cos + sin_incident * sin_theta_cos_phi) * wavevector
+    qz = (-sin_incident * delta_cos + cos_incident * sin_theta_cos_phi) * wavevector
+    qr_mag = np.hypot((sin_theta * sin_phi) * wavevector, qy)
+    qr = np.where(phi_rad >= 0.0, qr_mag, -qr_mag)
+
+    qr_flat = qr.reshape(-1)
+    qz_flat = qz.reshape(-1)
+    intensity_flat = cake.reshape(-1)
+    valid = (
+        np.isfinite(qr_flat)
+        & np.isfinite(qz_flat)
+        & np.isfinite(intensity_flat)
+    )
+    if not np.any(valid):
+        raise ValueError("No finite q-space samples were produced from the current angle-space image.")
+
+    qr_flat = qr_flat[valid]
+    qz_flat = qz_flat[valid]
+    intensity_flat = intensity_flat[valid]
+
+    qr_min = float(np.min(qr_flat))
+    qr_max = float(np.max(qr_flat))
+    qz_min = float(np.min(qz_flat))
+    qz_max = float(np.max(qz_flat))
+    if np.isclose(qr_min, qr_max):
+        qr_pad = max(abs(qr_min) * 0.01, 1.0e-3)
+        qr_min -= qr_pad
+        qr_max += qr_pad
+    if np.isclose(qz_min, qz_max):
+        qz_pad = max(abs(qz_min) * 0.01, 1.0e-3)
+        qz_min -= qz_pad
+        qz_max += qz_pad
+
+    qr_edges = np.linspace(qr_min, qr_max, qr_bins + 1, dtype=np.float64)
+    qz_edges = np.linspace(qz_min, qz_max, qz_bins + 1, dtype=np.float64)
+    weighted_sum, _, _ = np.histogram2d(
+        qz_flat,
+        qr_flat,
+        bins=(qz_edges, qr_edges),
+        weights=intensity_flat,
+    )
+    sample_count, _, _ = np.histogram2d(
+        qz_flat,
+        qr_flat,
+        bins=(qz_edges, qr_edges),
+    )
+    rebinned = np.divide(
+        weighted_sum,
+        sample_count,
+        out=np.zeros_like(weighted_sum, dtype=np.float64),
+        where=sample_count > 0.0,
+    )
+
+    qr_centers = 0.5 * (qr_edges[:-1] + qr_edges[1:])
+    qz_centers = 0.5 * (qz_edges[:-1] + qz_edges[1:])
+    return QSpaceResult(qr=qr_centers, qz=qz_centers, intensity=rebinned)
+
+
 __all__ = [
     "DEFAULT_ANGLE_SPACE_ENGINE",
     "DEFAULT_ANGLE_SPACE_WORKERS",
@@ -1275,8 +1385,10 @@ __all__ = [
     "DEFAULT_TWO_THETA_MIN_DEG",
     "DetectorCakeGeometry",
     "DetectorCakeResult",
+    "QSpaceResult",
     "PHI_ZERO_DIRECTIONS",
     "build_angle_axes",
+    "convert_phi_2theta_to_qr_qz_space",
     "convert_image_to_phi_2theta_space",
     "flat_solid_angle_normalization",
     "integrate_detector_to_cake_exact",
