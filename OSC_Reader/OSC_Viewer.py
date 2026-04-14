@@ -2,13 +2,19 @@ import argparse
 import os
 import sys
 from pathlib import Path
+import threading
 
 import numpy as np
 
 from .angle_space import (
     DEFAULT_ANGLE_SPACE_WORKERS,
+    DEFAULT_GUI_PHI_MAX_DEG,
+    DEFAULT_GUI_PHI_MIN_DEG,
+    DEFAULT_PHI_ZERO_DIRECTION,
+    PHI_ZERO_DIRECTIONS,
     convert_image_to_phi_2theta_space,
     prepare_gui_phi_display,
+    warm_angle_space_engine,
 )
 from .OSC_Reader import read_osc
 
@@ -88,18 +94,10 @@ if QtCore is not None and _QtSignal is not None:
                     radial_bins=self.radial_bins,
                     azimuth_bins=self.azimuth_bins,
                 )
-                cake, radial_deg, phi_deg = prepare_gui_phi_display(result)
             except Exception as exc:  # pragma: no cover - runtime/UI path
                 self.failed.emit(str(exc))
             else:
-                self.loaded.emit(
-                    {
-                        "result": result,
-                        "cake": cake,
-                        "radial_deg": radial_deg,
-                        "phi_deg": phi_deg,
-                    }
-                )
+                self.loaded.emit({"result": result})
             finally:
                 self.finished.emit()
 
@@ -108,6 +106,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     TARGET_FPS = 60.0
     MAX_PROFILE_POINTS = 800
     LOG_EPS = 1e-3
+    BEAM_CENTER_SEARCH_RADIUS_PX = 25
 
     def __init__(self, filename):
         super().__init__()
@@ -153,8 +152,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._conversion_worker = None
         self.beam_center_row = None
         self.beam_center_col = None
+        self._warmup_thread = None
 
         self._build_ui()
+        self._start_angle_space_warmup()
         if filename:
             QtCore.QTimer.singleShot(0, lambda: self.load_file(filename))
 
@@ -185,6 +186,31 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         low = max(min_value / 1.05, self.LOG_EPS)
         high = max(max_value * 1.05, low * 1.01)
         return low, high
+
+    @staticmethod
+    def _smooth_peak_window(window):
+        padded = np.pad(np.asarray(window, dtype=np.float64), 1, mode="edge")
+        return (
+            padded[:-2, :-2]
+            + 2.0 * padded[:-2, 1:-1]
+            + padded[:-2, 2:]
+            + 2.0 * padded[1:-1, :-2]
+            + 4.0 * padded[1:-1, 1:-1]
+            + 2.0 * padded[1:-1, 2:]
+            + padded[2:, :-2]
+            + 2.0 * padded[2:, 1:-1]
+            + padded[2:, 2:]
+        ) / 16.0
+
+    @staticmethod
+    def _parabolic_peak_offset(left, center, right):
+        denominator = float(left) - 2.0 * float(center) + float(right)
+        if np.isclose(denominator, 0.0):
+            return 0.0
+        offset = 0.5 * (float(left) - float(right)) / denominator
+        if not np.isfinite(offset):
+            return 0.0
+        return float(np.clip(offset, -0.5, 0.5))
 
     def _compute_axis_range(self, values, log_enabled):
         values = np.asarray(values, dtype=np.float64)
@@ -289,6 +315,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.pixel_size_spin = QtWidgets.QDoubleSpinBox()
         self.radial_bins_spin = QtWidgets.QSpinBox()
         self.azimuth_bins_spin = QtWidgets.QSpinBox()
+        self.phi_zero_direction_combo = QtWidgets.QComboBox()
 
         for spin in (self.center_col_spin, self.center_row_spin):
             spin.setDecimals(2)
@@ -312,6 +339,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             spin.setSingleStep(10)
         self.radial_bins_spin.setValue(1000)
         self.azimuth_bins_spin.setValue(720)
+        for direction in PHI_ZERO_DIRECTIONS:
+            self.phi_zero_direction_combo.addItem(direction.title())
+        self.phi_zero_direction_combo.setCurrentText(DEFAULT_PHI_ZERO_DIRECTION.title())
 
         geometry_layout.addWidget(QtWidgets.QLabel("Center X"))
         geometry_layout.addWidget(self.center_col_spin)
@@ -325,6 +355,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         geometry_layout.addWidget(self.radial_bins_spin)
         geometry_layout.addWidget(QtWidgets.QLabel("φ Bins"))
         geometry_layout.addWidget(self.azimuth_bins_spin)
+        geometry_layout.addWidget(QtWidgets.QLabel("φ=0 At"))
+        geometry_layout.addWidget(self.phi_zero_direction_combo)
         geometry_layout.addStretch(1)
         main_layout.addLayout(geometry_layout)
 
@@ -400,6 +432,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.left_log_button.toggled.connect(self.set_left_log_mode)
         self.center_col_spin.valueChanged.connect(self._on_beam_center_spin_changed)
         self.center_row_spin.valueChanged.connect(self._on_beam_center_spin_changed)
+        self.phi_zero_direction_combo.currentTextChanged.connect(
+            self._on_phi_zero_direction_changed
+        )
 
         self.mouse_proxy = pg.SignalProxy(
             self.image_plot.scene().sigMouseMoved,
@@ -429,6 +464,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.pixel_size_spin.setEnabled(enabled and self.detector_data is not None)
         self.radial_bins_spin.setEnabled(enabled and self.detector_data is not None)
         self.azimuth_bins_spin.setEnabled(enabled and self.detector_data is not None)
+        self.phi_zero_direction_combo.setEnabled(enabled and self.detector_data is not None)
 
     def _set_beam_center(self, row, col, update_spins=True):
         if self.detector_data is not None:
@@ -476,7 +512,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             return
         if enabled:
             self.info_label.setText(
-                "Click the detector image to place the beam center."
+                "Click the detector image to place the beam center. The click snaps to the nearest peak top."
             )
         elif self.data is not None:
             self.update_cursor(
@@ -484,6 +520,109 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 self.last_iy if self.last_iy is not None else self.height // 2,
                 force=True,
             )
+
+    def _snap_beam_center_to_peak(self, row, col):
+        if self.detector_data is None:
+            return float(row), float(col)
+
+        data = np.asarray(self.detector_data, dtype=np.float64)
+        row = float(np.clip(row, 0.0, data.shape[0] - 1))
+        col = float(np.clip(col, 0.0, data.shape[1] - 1))
+        radius = int(max(1, self.BEAM_CENTER_SEARCH_RADIUS_PX))
+        row_index = int(round(row))
+        col_index = int(round(col))
+
+        row_min = max(0, row_index - radius)
+        row_max = min(data.shape[0] - 1, row_index + radius)
+        col_min = max(0, col_index - radius)
+        col_max = min(data.shape[1] - 1, col_index + radius)
+        window = data[row_min : row_max + 1, col_min : col_max + 1]
+        if window.size == 0:
+            return row, col
+
+        smooth = self._smooth_peak_window(window)
+        valid = np.isfinite(smooth)
+        if not np.any(valid):
+            return row, col
+
+        peak_map = valid.copy()
+        padded = np.pad(smooth, 1, mode="edge")
+        for row_offset in (-1, 0, 1):
+            for col_offset in (-1, 0, 1):
+                if row_offset == 0 and col_offset == 0:
+                    continue
+                neighbour = padded[
+                    1 + row_offset : 1 + row_offset + smooth.shape[0],
+                    1 + col_offset : 1 + col_offset + smooth.shape[1],
+                ]
+                peak_map &= smooth >= neighbour
+        candidates = np.argwhere(peak_map)
+        if candidates.size == 0:
+            flat_index = int(np.nanargmax(np.where(valid, smooth, -np.inf)))
+            candidates = np.array([np.unravel_index(flat_index, smooth.shape)])
+
+        local_row = row - float(row_min)
+        local_col = col - float(col_min)
+        distances_sq = (
+            (candidates[:, 0].astype(np.float64) - local_row) ** 2
+            + (candidates[:, 1].astype(np.float64) - local_col) ** 2
+        )
+        intensities = smooth[candidates[:, 0], candidates[:, 1]]
+        best_index = np.lexsort((-intensities, distances_sq))[0]
+        peak_row = int(candidates[best_index, 0])
+        peak_col = int(candidates[best_index, 1])
+
+        row_offset = 0.0
+        col_offset = 0.0
+        if 0 < peak_row < smooth.shape[0] - 1:
+            row_offset = self._parabolic_peak_offset(
+                smooth[peak_row - 1, peak_col],
+                smooth[peak_row, peak_col],
+                smooth[peak_row + 1, peak_col],
+            )
+        if 0 < peak_col < smooth.shape[1] - 1:
+            col_offset = self._parabolic_peak_offset(
+                smooth[peak_row, peak_col - 1],
+                smooth[peak_row, peak_col],
+                smooth[peak_row, peak_col + 1],
+            )
+
+        snapped_row = float(np.clip(row_min + peak_row + row_offset, 0.0, data.shape[0] - 1))
+        snapped_col = float(np.clip(col_min + peak_col + col_offset, 0.0, data.shape[1] - 1))
+        return snapped_row, snapped_col
+
+    def _current_phi_zero_direction(self):
+        direction = self.phi_zero_direction_combo.currentText().strip().lower()
+        return direction or DEFAULT_PHI_ZERO_DIRECTION
+
+    def _start_angle_space_warmup(self):
+        if self._warmup_thread is not None and self._warmup_thread.is_alive():
+            return
+        self._warmup_thread = threading.Thread(
+            target=warm_angle_space_engine,
+            kwargs={"workers": 1},
+            daemon=True,
+        )
+        self._warmup_thread.start()
+
+    def _update_angle_space_display(self, *, force_show=False):
+        if self.angle_space_result is None:
+            return
+        cake, radial_deg, phi_deg = prepare_gui_phi_display(
+            self.angle_space_result,
+            phi_min_deg=DEFAULT_GUI_PHI_MIN_DEG,
+            phi_max_deg=DEFAULT_GUI_PHI_MAX_DEG,
+            zero_direction=self._current_phi_zero_direction(),
+        )
+        self.angle_space_cake = cake
+        if force_show or self.current_view_mode == "angle_space":
+            self.show_angle_space_view(cake, radial_deg, phi_deg)
+
+    def _on_phi_zero_direction_changed(self, _text):
+        self._update_angle_space_display(force_show=False)
+
+    def _set_image_aspect_locked(self, locked):
+        self.image_view.setAspectLocked(bool(locked))
 
     def _start_conversion(self):
         if self._converting or self.detector_data is None:
@@ -504,18 +643,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                     radial_bins=self.radial_bins_spin.value(),
                     azimuth_bins=self.azimuth_bins_spin.value(),
                 )
-                cake, radial_deg, phi_deg = prepare_gui_phi_display(result)
             except Exception as exc:  # pragma: no cover - fallback error path
                 self._on_conversion_failed(str(exc))
             else:
-                self._on_conversion_loaded(
-                    {
-                        "result": result,
-                        "cake": cake,
-                        "radial_deg": radial_deg,
-                        "phi_deg": phi_deg,
-                    }
-                )
+                self._on_conversion_loaded({"result": result})
                 self._set_interaction_enabled(self.data is not None)
             return
 
@@ -549,12 +680,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
     def _on_conversion_loaded(self, payload):
         self.angle_space_result = payload["result"]
-        self.angle_space_cake = payload["cake"]
-        self.show_angle_space_view(
-            payload["cake"],
-            payload["radial_deg"],
-            payload["phi_deg"],
-        )
+        self._update_angle_space_display(force_show=True)
 
     def _on_conversion_failed(self, message):
         QtWidgets.QMessageBox.critical(
@@ -743,6 +869,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.pick_center_button.blockSignals(True)
         self.pick_center_button.setChecked(False)
         self.pick_center_button.blockSignals(False)
+        self._set_image_aspect_locked(True)
         x_coords = np.arange(self.detector_data.shape[1], dtype=np.float64)
         y_coords = np.arange(self.detector_data.shape[0], dtype=np.float64)
         self._set_display_data(
@@ -758,12 +885,22 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.pick_center_button.blockSignals(True)
         self.pick_center_button.setChecked(False)
         self.pick_center_button.blockSignals(False)
+        self._set_image_aspect_locked(False)
         self._set_display_data(
             cake,
             radial_deg,
             phi_deg,
             "2θ (degrees)",
             "φ (degrees)",
+        )
+        self.image_plot.setLimits(
+            yMin=DEFAULT_GUI_PHI_MIN_DEG,
+            yMax=DEFAULT_GUI_PHI_MAX_DEG,
+        )
+        self.image_view.setYRange(
+            DEFAULT_GUI_PHI_MIN_DEG,
+            DEFAULT_GUI_PHI_MAX_DEG,
+            padding=0.0,
         )
 
     def prepare_profile_cache(self):
@@ -839,7 +976,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         x_data = float(mouse_point.x())
         y_data = float(mouse_point.y())
         if self.current_view_mode == "detector" and self.pick_center_button.isChecked():
-            self._set_beam_center(y_data, x_data)
+            snapped_row, snapped_col = self._snap_beam_center_to_peak(y_data, x_data)
+            self._set_beam_center(snapped_row, snapped_col)
+            x_data = snapped_col
+            y_data = snapped_row
             self.pick_center_button.blockSignals(True)
             self.pick_center_button.setChecked(False)
             self.pick_center_button.blockSignals(False)

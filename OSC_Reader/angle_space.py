@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 import os
+import threading
 
 import numpy as np
 
@@ -29,13 +30,24 @@ def _optional_njit(*jit_args, **jit_kwargs):
 
 EPS32 = 1.0 + np.finfo(np.float32).eps
 BEAM_CENTER_CHI_DEG = 135.0
-DEFAULT_ANGLE_SPACE_WORKERS = 24
+DEFAULT_ANGLE_SPACE_WORKERS = 8
 DEFAULT_ANGLE_SPACE_ENGINE = "numba"
 DEFAULT_TWO_THETA_MIN_DEG = 0.0
 DEFAULT_TWO_THETA_MAX_DEG = 90.0
 DEFAULT_PHI_MIN_DEG = -180.0
 DEFAULT_PHI_MAX_DEG = 180.0
-PHI_ZERO_OFFSET_DEGREES = -90.0
+DEFAULT_GUI_PHI_MIN_DEG = -180.0
+DEFAULT_GUI_PHI_MAX_DEG = 180.0
+DEFAULT_PHI_ZERO_DIRECTION = "up"
+PHI_ZERO_DIRECTIONS = ("up", "left", "down", "right")
+_PHI_ZERO_DIRECTION_TO_AZIMUTH_DEG = {
+    "right": 0.0,
+    "down": 90.0,
+    "left": 180.0,
+    "up": -90.0,
+}
+_ANGLE_SPACE_WARMUP_LOCK = threading.Lock()
+_ANGLE_SPACE_WARMED = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,26 @@ def _validate_axes(radial_deg: np.ndarray, azimuthal_deg: np.ndarray) -> None:
         raise ValueError("radial_deg must be uniformly spaced.")
     if not np.allclose(azimuthal_step, azimuthal_step[0], rtol=1.0e-7, atol=1.0e-12):
         raise ValueError("azimuthal_deg must be uniformly spaced.")
+
+
+def _wrap_signed_degrees(values: np.ndarray) -> np.ndarray:
+    return (np.asarray(values, dtype=np.float64) + 180.0) % 360.0 - 180.0
+
+
+def _normalize_phi_zero_direction(zero_direction: str) -> str:
+    direction = str(zero_direction).strip().lower()
+    if direction not in _PHI_ZERO_DIRECTION_TO_AZIMUTH_DEG:
+        choices = ", ".join(option.title() for option in PHI_ZERO_DIRECTIONS)
+        raise ValueError(f"zero_direction must be one of: {choices}.")
+    return direction
+
+
+def _phi_zero_azimuth_deg(zero_direction: str) -> float:
+    return float(
+        _PHI_ZERO_DIRECTION_TO_AZIMUTH_DEG[
+            _normalize_phi_zero_direction(zero_direction)
+        ]
+    )
 
 
 def _prepare_inputs(
@@ -165,7 +197,8 @@ def _resolve_workers(workers: int | str | None, work_items: int, engine: str) ->
         resolved = _default_worker_count()
     else:
         resolved = int(workers)
-    return max(1, min(resolved, int(work_items)))
+    cpu_limit = int(os.cpu_count() or resolved)
+    return max(1, min(resolved, int(work_items), cpu_limit))
 
 
 def _chunk_ranges(length: int, workers: int) -> list[tuple[int, int]]:
@@ -1185,20 +1218,41 @@ def convert_image_to_phi_2theta_space(
     )
 
 
+def warm_angle_space_engine(*, workers: int | str | None = 1) -> None:
+    if not _HAS_NUMBA:
+        return
+    global _ANGLE_SPACE_WARMED
+    if _ANGLE_SPACE_WARMED:
+        return
+    with _ANGLE_SPACE_WARMUP_LOCK:
+        if _ANGLE_SPACE_WARMED:
+            return
+        dummy_shape = (32, 32)
+        dummy = np.zeros(dummy_shape, dtype=np.float32)
+        convert_image_to_phi_2theta_space(
+            dummy,
+            distance_mm=75.0,
+            pixel_size_mm=0.1,
+            center_row_px=(dummy_shape[0] - 1) / 2.0,
+            center_col_px=(dummy_shape[1] - 1) / 2.0,
+            radial_bins=32,
+            azimuth_bins=32,
+            workers=workers,
+        )
+        _ANGLE_SPACE_WARMED = True
+
+
 def prepare_gui_phi_display(
     result: DetectorCakeResult,
     *,
-    phi_min_deg: float = DEFAULT_PHI_MIN_DEG,
-    phi_max_deg: float = DEFAULT_PHI_MAX_DEG,
+    phi_min_deg: float = DEFAULT_GUI_PHI_MIN_DEG,
+    phi_max_deg: float = DEFAULT_GUI_PHI_MAX_DEG,
+    zero_direction: str = DEFAULT_PHI_ZERO_DIRECTION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    gui_phi = (
-        (
-            PHI_ZERO_OFFSET_DEGREES
-            - np.asarray(result.azimuthal_deg, dtype=np.float64)
-            + 180.0
-        )
-        % 360.0
-    ) - 180.0
+    gui_phi = _wrap_signed_degrees(
+        _phi_zero_azimuth_deg(zero_direction)
+        - np.asarray(result.azimuthal_deg, dtype=np.float64)
+    )
     order = np.argsort(gui_phi)
     gui_phi = gui_phi[order]
     cake = np.asarray(result.intensity, dtype=np.float64)[order, :]
@@ -1212,15 +1266,20 @@ def prepare_gui_phi_display(
 __all__ = [
     "DEFAULT_ANGLE_SPACE_ENGINE",
     "DEFAULT_ANGLE_SPACE_WORKERS",
+    "DEFAULT_GUI_PHI_MAX_DEG",
+    "DEFAULT_GUI_PHI_MIN_DEG",
     "DEFAULT_PHI_MAX_DEG",
     "DEFAULT_PHI_MIN_DEG",
+    "DEFAULT_PHI_ZERO_DIRECTION",
     "DEFAULT_TWO_THETA_MAX_DEG",
     "DEFAULT_TWO_THETA_MIN_DEG",
     "DetectorCakeGeometry",
     "DetectorCakeResult",
+    "PHI_ZERO_DIRECTIONS",
     "build_angle_axes",
     "convert_image_to_phi_2theta_space",
     "flat_solid_angle_normalization",
     "integrate_detector_to_cake_exact",
     "prepare_gui_phi_display",
+    "warm_angle_space_engine",
 ]
