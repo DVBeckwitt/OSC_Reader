@@ -17,6 +17,7 @@ from .angle_space import (
     _compute_intensity_sem,
     convert_phi_2theta_to_qr_qz_space,
     convert_image_to_phi_2theta_space,
+    fast_display_sigma_maps,
     prepare_gui_phi_display_data,
     prepare_gui_phi_display,
     warm_angle_space_engine,
@@ -707,6 +708,12 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         mode = self._current_angle_display_mode()
         if mode == "intensity":
             values = self.angle_space_result.intensity
+        elif mode == "theta_sigma":
+            values, _ = self._fast_angle_sigma_display_values()
+            return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
+        elif mode == "phi_sigma":
+            _, values = self._fast_angle_sigma_display_values()
+            return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
         else:
             error_result = self._ensure_angle_space_error_result()
             if mode == "intensity_sem":
@@ -714,19 +721,20 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 if values is None:
                     raise ValueError("Angle-space intensity error is unavailable.")
                 return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
-            coordinate_stats = error_result.coordinate_stats
-            if coordinate_stats is None:
-                raise ValueError("Analytic coordinate uncertainty is unavailable for this conversion.")
-            if mode == "theta_sigma":
-                values = coordinate_stats.radial_sigma_deg
-            elif mode == "phi_sigma":
-                values = coordinate_stats.azimuthal_sigma_deg
-            else:
-                values = self.angle_space_result.intensity
-                mode = "intensity"
+            values = self.angle_space_result.intensity
+            mode = "intensity"
         if values is None:
             raise ValueError("Selected display data is unavailable.")
         return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
+
+    def _fast_angle_sigma_display_values(self):
+        if self.angle_space_result is None:
+            raise ValueError("Angle-space result is unavailable.")
+        return fast_display_sigma_maps(
+            self.angle_space_result,
+            pixel_size_m=self.pixel_size_spin.value() * 1.0e-3,
+            distance_m=self.distance_spin.value() * 1.0e-3,
+        )
 
     @staticmethod
     def _format_display_value(value):
@@ -2257,19 +2265,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             mode = self._current_angle_display_mode()
             if mode == "intensity_sem":
                 self._ensure_angle_space_error_result()
-            elif (
-                self.angle_space_error_result is None
-                or self.angle_space_error_result.coordinate_stats is None
-            ):
-                if not self._converting:
-                    self._start_conversion(target_view="angle_space_error")
-                return
         display_values, value_label = self._angle_space_display_values()
-        display_result = (
-            self.angle_space_result
-            if self._current_angle_display_mode() == "intensity"
-            else self.angle_space_error_result
-        )
+        display_mode = self._current_angle_display_mode()
+        display_result = self.angle_space_result
+        if display_mode == "intensity_sem":
+            display_result = self.angle_space_error_result
         display_cake, radial_deg, phi_deg = prepare_gui_phi_display_data(
             display_result,
             display_values,

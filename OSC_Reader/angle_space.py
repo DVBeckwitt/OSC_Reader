@@ -889,49 +889,90 @@ def _analytic_coordinate_sigma_deg(
     azimuthal_deg: np.ndarray,
     geometry: DetectorCakeGeometry,
 ) -> tuple[np.ndarray, np.ndarray]:
-    radial_eval = np.asarray(radial_deg, dtype=np.float64)
-    azimuthal_eval = np.asarray(azimuthal_deg, dtype=np.float64)
+    radial_eval, azimuthal_eval = np.broadcast_arrays(
+        np.asarray(radial_deg, dtype=np.float64),
+        np.asarray(azimuthal_deg, dtype=np.float64),
+    )
     radial_sigma = np.full_like(radial_eval, np.nan, dtype=np.float64)
     azimuthal_sigma = np.full_like(radial_eval, np.nan, dtype=np.float64)
+    valid = np.isfinite(radial_eval) & np.isfinite(azimuthal_eval)
+    if not np.any(valid):
+        return radial_sigma, azimuthal_sigma
 
-    distance = float(geometry.distance_m)
-    pixel_size = float(geometry.pixel_size_m)
+    sigma_tth, sigma_phi = fast_display_sigma_profiles(
+        radial_eval[valid],
+        pixel_size_m=geometry.pixel_size_m,
+        distance_m=geometry.distance_m,
+    )
+    radial_sigma[valid] = sigma_tth.astype(np.float64, copy=False)
+    azimuthal_sigma[valid] = sigma_phi.astype(np.float64, copy=False)
+    return radial_sigma, azimuthal_sigma
+
+
+def fast_display_sigma_profiles(
+    radial_deg: np.ndarray,
+    *,
+    pixel_size_m: float,
+    distance_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    theta = np.deg2rad(np.asarray(radial_deg, dtype=np.float64))
+    sigma_tth = np.full_like(theta, np.nan, dtype=np.float64)
+    sigma_phi = np.full_like(theta, np.nan, dtype=np.float64)
+
+    distance = float(distance_m)
+    pixel_size = float(pixel_size_m)
     valid = (
-        np.isfinite(radial_eval)
-        & np.isfinite(azimuthal_eval)
+        np.isfinite(theta)
         & np.isfinite(distance)
         & np.isfinite(pixel_size)
         & (distance > 0.0)
         & (pixel_size > 0.0)
     )
     if not np.any(valid):
-        return radial_sigma, azimuthal_sigma
+        return sigma_tth.astype(np.float32), sigma_phi.astype(np.float32)
 
-    t_rad = np.deg2rad(radial_eval[valid])
-    phi_rad = np.deg2rad(azimuthal_eval[valid])
-    cos_t = np.cos(t_rad)
-    tan_t = np.tan(t_rad)
-    cos_phi = np.cos(phi_rad)
-    sin_phi = np.sin(phi_rad)
-    pixel_variance = (pixel_size * pixel_size) / 12.0
-    distance_sq = distance * distance
+    prefactor = np.rad2deg(pixel_size / (np.sqrt(12.0) * distance))
+    valid_theta = theta[valid]
+    sigma_tth[valid] = prefactor * np.cos(valid_theta) ** 2
 
-    radial_var = ((cos_t ** 4) / distance_sq) * (
-        (pixel_variance * cos_phi * cos_phi) + (pixel_variance * sin_phi * sin_phi)
-    )
-    radial_sigma[valid] = np.rad2deg(np.sqrt(np.maximum(radial_var, 0.0)))
-
-    phi_valid = np.abs(tan_t) > 1.0e-15
+    tan_theta = np.tan(valid_theta)
+    phi_valid = np.abs(tan_theta) > 1.0e-15
     if np.any(phi_valid):
-        phi_var = (
-            (pixel_variance * sin_phi[phi_valid] * sin_phi[phi_valid])
-            + (pixel_variance * cos_phi[phi_valid] * cos_phi[phi_valid])
-        ) / (distance_sq * (tan_t[phi_valid] ** 2))
-        azimuthal_sigma_valid = np.rad2deg(np.sqrt(np.maximum(phi_var, 0.0)))
-        azimuthal_sigma_flat = azimuthal_sigma.reshape(-1)
         valid_indices = np.flatnonzero(valid.reshape(-1))
-        azimuthal_sigma_flat[valid_indices[phi_valid]] = azimuthal_sigma_valid
-    return radial_sigma, azimuthal_sigma
+        sigma_phi_flat = sigma_phi.reshape(-1)
+        sigma_phi_flat[valid_indices[phi_valid]] = prefactor / np.abs(tan_theta[phi_valid])
+    return sigma_tth.astype(np.float32), sigma_phi.astype(np.float32)
+
+
+def fast_display_sigma_maps(
+    result: DetectorCakeResult,
+    *,
+    pixel_size_m: float,
+    distance_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    sigma_tth_profile, sigma_phi_profile = fast_display_sigma_profiles(
+        result.radial_deg,
+        pixel_size_m=pixel_size_m,
+        distance_m=distance_m,
+    )
+    display_shape = np.asarray(result.intensity).shape
+    sigma_tth = np.array(
+        np.broadcast_to(sigma_tth_profile[np.newaxis, :], display_shape),
+        dtype=np.float32,
+        copy=True,
+    )
+    sigma_phi = np.array(
+        np.broadcast_to(sigma_phi_profile[np.newaxis, :], display_shape),
+        dtype=np.float32,
+        copy=True,
+    )
+    invalid = (
+        ~np.isfinite(np.asarray(result.sum_normalization, dtype=np.float64))
+        | (np.asarray(result.sum_normalization, dtype=np.float64) <= 0.0)
+    )
+    sigma_tth[invalid] = np.nan
+    sigma_phi[invalid] = np.nan
+    return sigma_tth, sigma_phi
 
 
 def _apply_analytic_coordinate_uncertainty(
@@ -2323,6 +2364,8 @@ __all__ = [
     "convert_phi_2theta_to_qr_qz_space",
     "convert_image_to_phi_2theta_space",
     "flat_solid_angle_normalization",
+    "fast_display_sigma_maps",
+    "fast_display_sigma_profiles",
     "integrate_detector_to_cake_exact",
     "prepare_gui_phi_display",
     "warm_angle_space_engine",

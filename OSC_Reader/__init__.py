@@ -69,6 +69,8 @@ _OPTIONAL_EXPORTS: Dict[str, Tuple[str, str]] = {
     "compute_detector_to_cake_coordinate_statistics": ("angle_space", "compute_detector_to_cake_coordinate_statistics"),
     "convert_phi_2theta_to_qr_qz_space": ("angle_space", "convert_phi_2theta_to_qr_qz_space"),
     "convert_image_to_phi_2theta_space": ("angle_space", "convert_image_to_phi_2theta_space"),
+    "fast_display_sigma_maps": ("angle_space", "fast_display_sigma_maps"),
+    "fast_display_sigma_profiles": ("angle_space", "fast_display_sigma_profiles"),
     "flat_solid_angle_normalization": ("angle_space", "flat_solid_angle_normalization"),
     "integrate_detector_to_cake_exact": ("angle_space", "integrate_detector_to_cake_exact"),
     "prepare_gui_phi_display": ("angle_space", "prepare_gui_phi_display"),
