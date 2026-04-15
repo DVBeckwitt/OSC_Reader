@@ -524,6 +524,7 @@ print(phi_deg.min(), phi_deg.max())
 - `radial_deg`
 - `azimuthal_deg`
 - `intensity`
+- `intensity_sem`
 - `sum_signal`
 - `sum_normalization`
 - `count`

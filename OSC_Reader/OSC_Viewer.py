@@ -148,16 +148,17 @@ _ROI_COLORS = (
 
 _ANGLE_SPACE_ERROR_DISPLAY_MODES = (
     ("intensity_sem", "Intensity Error"),
-    ("theta_sigma", "2θ Uncertainty"),
-    ("phi_sigma", "φ Uncertainty"),
+    ("coordinate_profiles", "2θ + φ Uncertainty Profiles"),
 )
 
 _ANGLE_SPACE_DISPLAY_LABELS = {
     "intensity": "Intensity",
     "intensity_sem": "Intensity Error (SEM)",
-    "theta_sigma": "2θ Uncertainty (deg)",
-    "phi_sigma": "φ Uncertainty (deg)",
+    "coordinate_profiles": "2θ + φ Uncertainty Profiles",
 }
+
+_VIEWER_DEFAULT_RADIAL_BINS = 1000
+_VIEWER_DEFAULT_AZIMUTH_BINS = 720
 
 
 def _nanmean_profile(values, *, axis):
@@ -224,6 +225,65 @@ def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False
     if vmax <= vmin:
         vmax = slider_high
     return vmin, vmax
+
+
+def _normalize_angle_display_mode(mode):
+    choice = None if mode is None else str(mode).strip()
+    if not choice:
+        return None
+    if choice in {"theta_sigma", "phi_sigma"}:
+        return "coordinate_profiles"
+    return choice
+
+
+def _merge_angle_error_result(
+    base_result,
+    error_result=None,
+    *,
+    require_intensity_sem=False,
+    require_coordinate_stats=False,
+    coordinate_stats_loader=None,
+):
+    if base_result is None:
+        raise ValueError("Angle-space result is unavailable.")
+
+    intensity_sem = base_result.intensity_sem
+    coordinate_stats = base_result.coordinate_stats
+    if error_result is not None:
+        if intensity_sem is None:
+            intensity_sem = error_result.intensity_sem
+        if coordinate_stats is None:
+            coordinate_stats = error_result.coordinate_stats
+
+    if require_intensity_sem and intensity_sem is None:
+        intensity_sem = _compute_intensity_sem(
+            base_result.sum_normalization,
+            base_result.count,
+            variance_per_effective_pixel=1.0,
+        )
+
+    if require_coordinate_stats and coordinate_stats is None:
+        if coordinate_stats_loader is None:
+            raise ValueError("Angle-space coordinate statistics are unavailable.")
+        coordinate_stats = coordinate_stats_loader()
+
+    if error_result is not None and (
+        error_result.intensity_sem is intensity_sem
+        and error_result.coordinate_stats is coordinate_stats
+    ):
+        return error_result
+
+    if (
+        intensity_sem is base_result.intensity_sem
+        and coordinate_stats is base_result.coordinate_stats
+    ):
+        return base_result if error_result is None else error_result
+
+    return replace(
+        base_result,
+        intensity_sem=intensity_sem,
+        coordinate_stats=coordinate_stats,
+    )
 
 
 if QtCore is not None and _QtSignal is not None:
@@ -297,18 +357,17 @@ if QtCore is not None and _QtSignal is not None:
 
 
 if QtWidgets is not None:
-    class _AngleErrorProfileWindow(QtWidgets.QDialog):
+    class _AngleErrorProfilesWidget(QtWidgets.QWidget):
         def __init__(self, *, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("Angle Error Profiles")
-            self.resize(940, 720)
+            self.setObjectName("angleErrorProfilesPage")
 
             root_layout = QtWidgets.QVBoxLayout(self)
             root_layout.setContentsMargins(12, 12, 12, 12)
             root_layout.setSpacing(10)
 
             self.summary_label = QtWidgets.QLabel(
-                "Coordinate error profiles appear here when 2θ or φ uncertainty is selected."
+                "Uncertainty profiles appear here when the merged 2θ/φ uncertainty mode is selected."
             )
             self.summary_label.setWordWrap(True)
             root_layout.addWidget(self.summary_label)
@@ -329,11 +388,15 @@ if QtWidgets is not None:
             self.phi_plot.setLabel("bottom", "φ (degrees)")
             self.phi_plot.showGrid(x=True, y=True, alpha=0.25)
             self.phi_curve = self.phi_plot.plot([], [], pen=pg.mkPen("#ffb020", width=2))
+            self.clear_profiles(self.summary_label.text())
 
         def clear_profiles(self, summary):
             self.summary_label.setText(str(summary))
             self.theta_curve.setData([], [])
             self.phi_curve.setData([], [])
+            self.reset_view()
+
+        def reset_view(self):
             self.theta_plot.enableAutoRange()
             self.phi_plot.enableAutoRange()
 
@@ -347,8 +410,7 @@ if QtWidgets is not None:
                 np.asarray(phi_x, dtype=np.float64),
                 np.asarray(phi_y, dtype=np.float64),
             )
-            self.theta_plot.enableAutoRange()
-            self.phi_plot.enableAutoRange()
+            self.reset_view()
 
     class _CollapsibleSection(QtWidgets.QFrame):
         def __init__(self, title, *, expanded=True, collapsible=True, parent=None):
@@ -702,7 +764,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._selected_roi_names = set()
         self._updating_roi = False
         self.roi_profile_window = None
-        self.angle_error_profile_window = None
+        self.main_display_stack = None
+        self.angle_error_profiles_widget = None
         self._roi_window_pending_initial_draw = False
         self._cache_state = _load_viewer_cache()
         self._restoring_cache = False
@@ -789,14 +852,16 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         error_button = getattr(self, "angle_error_view_button", None)
         if error_button is None or not error_button.isChecked():
             return "intensity"
-        mode = self.angle_display_combo.currentData()
-        return str(mode) if mode else "intensity_sem"
+        mode = _normalize_angle_display_mode(self.angle_display_combo.currentData())
+        if mode in {"intensity_sem", "coordinate_profiles"}:
+            return mode
+        return "intensity_sem"
 
     def _coordinate_error_profiles_requested(self):
         error_button = getattr(self, "angle_error_view_button", None)
         if error_button is None or not error_button.isChecked():
             return False
-        return self._current_angle_display_mode() in {"theta_sigma", "phi_sigma"}
+        return self._current_angle_display_mode() == "coordinate_profiles"
 
     def _coordinate_error_profiles_active(self):
         return self.current_view_mode == "angle_space" and self._coordinate_error_profiles_requested()
@@ -809,6 +874,16 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             and self.current_view_mode == "angle_space"
             and self._current_angle_display_mode() == "intensity_sem"
         )
+
+    def _set_main_display_page(self, page_name):
+        if self.main_display_stack is None:
+            return
+        target = self.graphics
+        if page_name == "profiles" and self.angle_error_profiles_widget is not None:
+            target = self.angle_error_profiles_widget
+            self.pending_dirty = False
+        if self.main_display_stack.currentWidget() is not target:
+            self.main_display_stack.setCurrentWidget(target)
 
     def _current_angle_space_geometry(self):
         if self.beam_center_row is None or self.beam_center_col is None:
@@ -838,17 +913,25 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self._current_angle_space_geometry(),
         )
 
-    def _ensure_angle_error_profile_window(self):
-        if self.angle_error_profile_window is None:
-            self.angle_error_profile_window = _AngleErrorProfileWindow(parent=self)
-        return self.angle_error_profile_window
-
-    def _close_angle_error_profile_window(self):
-        if self.angle_error_profile_window is not None:
-            self.angle_error_profile_window.hide()
+    def _angle_error_metrics_available(self, mode):
+        if self.angle_space_result is None:
+            return False
+        base_result = self.angle_space_result
+        error_result = self.angle_space_error_result
+        if mode == "intensity_sem":
+            return (
+                base_result.intensity_sem is not None
+                or (error_result is not None and error_result.intensity_sem is not None)
+            )
+        if mode == "coordinate_profiles":
+            return (
+                base_result.coordinate_stats is not None
+                or (error_result is not None and error_result.coordinate_stats is not None)
+            )
+        return True
 
     def _angle_error_profiles(self):
-        error_result = self._ensure_angle_space_error_result()
+        error_result = self._ensure_angle_space_error_result(require_coordinate_stats=True)
         coordinate_stats = error_result.coordinate_stats
         if coordinate_stats is None:
             raise ValueError("Angle-space coordinate statistics are unavailable.")
@@ -870,59 +953,38 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         theta_profile = _nanmean_profile(theta_sigma_map, axis=0)
         phi_profile = _nanmean_profile(phi_sigma_map, axis=1)
         summary = (
-            "2θ profile = mean 2θ uncertainty across displayed φ bins. "
-            "φ profile = mean φ uncertainty across displayed 2θ bins."
+            "Top plot = mean 2θ uncertainty across displayed φ bins. "
+            "Bottom plot = mean φ uncertainty across displayed 2θ bins."
         )
         return radial_deg, theta_profile, phi_deg, phi_profile, summary
 
-    def _update_angle_error_profiles_window(self, *, show_window=False):
+    def _update_angle_error_profiles_page(self):
         if not self._coordinate_error_profiles_active():
-            self._close_angle_error_profile_window()
+            self._set_main_display_page("heatmap")
             return
         radial_deg, theta_profile, phi_deg, phi_profile, summary = self._angle_error_profiles()
-        window = self._ensure_angle_error_profile_window()
-        window.update_profiles(
+        self.angle_error_profiles_widget.update_profiles(
             radial_deg,
             theta_profile,
             phi_deg,
             phi_profile,
             summary,
         )
-        if show_window or not window.isVisible():
-            window.show()
-            window.raise_()
-            window.activateWindow()
+        self._set_main_display_page("profiles")
+        self._set_status_message(summary)
 
-    def _ensure_angle_space_error_result(self):
-        if self.angle_space_result is None:
-            raise ValueError("Angle-space result is unavailable.")
-        base_result = self.angle_space_result
-        error_result = self.angle_space_error_result
-        intensity_sem = base_result.intensity_sem
-        coordinate_stats = base_result.coordinate_stats
-        if error_result is not None:
-            if intensity_sem is None:
-                intensity_sem = error_result.intensity_sem
-            if coordinate_stats is None:
-                coordinate_stats = error_result.coordinate_stats
-        if coordinate_stats is None:
-            coordinate_stats = self._ensure_angle_space_coordinate_stats()
-        if intensity_sem is None:
-            intensity_sem = _compute_intensity_sem(
-                base_result.sum_normalization,
-                base_result.count,
-                variance_per_effective_pixel=1.0,
-            )
-        if (
-            error_result is not None
-            and error_result.intensity_sem is intensity_sem
-            and error_result.coordinate_stats is coordinate_stats
-        ):
-            return error_result
-        self.angle_space_error_result = replace(
-            base_result,
-            intensity_sem=intensity_sem,
-            coordinate_stats=coordinate_stats,
+    def _ensure_angle_space_error_result(
+        self,
+        *,
+        require_intensity_sem=False,
+        require_coordinate_stats=False,
+    ):
+        self.angle_space_error_result = _merge_angle_error_result(
+            self.angle_space_result,
+            self.angle_space_error_result,
+            require_intensity_sem=require_intensity_sem,
+            require_coordinate_stats=require_coordinate_stats,
+            coordinate_stats_loader=self._ensure_angle_space_coordinate_stats,
         )
         return self.angle_space_error_result
 
@@ -932,25 +994,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         mode = self._current_angle_display_mode()
         if mode == "intensity":
             values = self.angle_space_result.intensity
-        elif mode == "theta_sigma":
-            error_result = self._ensure_angle_space_error_result()
-            if error_result.coordinate_stats is None:
-                raise ValueError("Angle-space coordinate statistics are unavailable.")
-            values = error_result.coordinate_stats.radial_sigma_deg
-            return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
-        elif mode == "phi_sigma":
-            error_result = self._ensure_angle_space_error_result()
-            if error_result.coordinate_stats is None:
-                raise ValueError("Angle-space coordinate statistics are unavailable.")
-            values = error_result.coordinate_stats.azimuthal_sigma_deg
+        elif mode == "intensity_sem":
+            error_result = self._ensure_angle_space_error_result(require_intensity_sem=True)
+            values = error_result.intensity_sem
+            if values is None:
+                raise ValueError("Angle-space intensity error is unavailable.")
             return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
         else:
-            error_result = self._ensure_angle_space_error_result()
-            if mode == "intensity_sem":
-                values = error_result.intensity_sem
-                if values is None:
-                    raise ValueError("Angle-space intensity error is unavailable.")
-                return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
             values = self.angle_space_result.intensity
             mode = "intensity"
         if values is None:
@@ -1652,7 +1702,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             combo.setCurrentIndex(index)
 
     def _set_combo_data_if_present(self, combo, value):
-        choice = self._coerce_choice(value)
+        choice = _normalize_angle_display_mode(self._coerce_choice(value))
         if choice is None:
             return
         index = combo.findData(choice)
@@ -1730,6 +1780,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         try:
             if isinstance(sampling, dict):
                 radial_bins = self._coerce_int(sampling.get("radial_bins"))
+                azimuth_bins = self._coerce_int(sampling.get("azimuth_bins"))
                 if radial_bins is not None:
                     self.radial_bins_spin.setValue(
                         int(
@@ -1740,7 +1791,6 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                             )
                         )
                     )
-                azimuth_bins = self._coerce_int(sampling.get("azimuth_bins"))
                 if azimuth_bins is not None:
                     self.azimuth_bins_spin.setValue(
                         int(
@@ -1836,8 +1886,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._set_roi_overlay_visible(roi_visible and self.roi_button.isChecked())
         if not roi_visible:
             self._close_roi_profile_window()
-        if not self._coordinate_error_profiles_active():
-            self._close_angle_error_profile_window()
+        self._set_main_display_page(
+            "profiles" if self._coordinate_error_profiles_active() else "heatmap"
+        )
         error_metric_enabled = angle_error_visible and self.angle_error_view_button.isChecked()
         self.angle_display_label.setEnabled(error_metric_enabled)
         self.angle_display_combo.setEnabled(error_metric_enabled)
@@ -2036,8 +2087,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             spin.setRange(2, 10000)
             spin.setSingleStep(10)
             spin.setMinimumWidth(132)
-        self.radial_bins_spin.setValue(1000)
-        self.azimuth_bins_spin.setValue(720)
+        self.radial_bins_spin.setValue(_VIEWER_DEFAULT_RADIAL_BINS)
+        self.azimuth_bins_spin.setValue(_VIEWER_DEFAULT_AZIMUTH_BINS)
 
         self.phi_zero_direction_combo.setMinimumWidth(132)
         self.phi_zero_direction_combo.setToolTip(
@@ -2049,7 +2100,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
         self.angle_display_combo.setMinimumWidth(164)
         self.angle_display_combo.setToolTip(
-            "Choose which φ/2θ error map to show while Error View is enabled."
+            "Choose which φ/2θ error visualization to show while Error View is enabled."
         )
         for mode, label in _ANGLE_SPACE_ERROR_DISPLAY_MODES:
             self.angle_display_combo.addItem(label, mode)
@@ -2136,13 +2187,17 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         settings_layout.addWidget(self.profiles_section, 1)
         main_layout.addWidget(settings_shelf)
 
+        self.main_display_stack = QtWidgets.QStackedWidget()
         self.graphics = pg.GraphicsLayoutWidget()
         self.graphics.ci.layout.setColumnStretchFactor(0, 1)
         self.graphics.ci.layout.setColumnStretchFactor(1, 5)
         self.graphics.ci.layout.setColumnStretchFactor(2, 1)
         self.graphics.ci.layout.setRowStretchFactor(0, 5)
         self.graphics.ci.layout.setRowStretchFactor(1, 1)
-        main_layout.addWidget(self.graphics, 1)
+        self.angle_error_profiles_widget = _AngleErrorProfilesWidget(parent=self.main_display_stack)
+        self.main_display_stack.addWidget(self.graphics)
+        self.main_display_stack.addWidget(self.angle_error_profiles_widget)
+        main_layout.addWidget(self.main_display_stack, 1)
 
         self.left_plot = self.graphics.addPlot(row=0, col=0)
         self.image_view = _ImageViewBox(owner=self)
@@ -2484,12 +2539,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         )
         self.angle_space_cake = cake
         display_mode = self._current_angle_display_mode()
-        profile_mode = self._coordinate_error_profiles_requested()
-        if self.angle_error_view_button.isChecked() and not profile_mode:
-            mode = self._current_angle_display_mode()
-            if mode == "intensity_sem":
-                self._ensure_angle_space_error_result()
-        if profile_mode:
+        profile_mode_requested = self._coordinate_error_profiles_requested()
+        if self.angle_error_view_button.isChecked():
+            if display_mode == "intensity_sem":
+                self._ensure_angle_space_error_result(require_intensity_sem=True)
+        if profile_mode_requested:
             display_values = self.angle_space_result.intensity
             value_label = _ANGLE_SPACE_DISPLAY_LABELS.get("intensity", "Intensity")
             display_result = self.angle_space_result
@@ -2512,7 +2566,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 phi_deg,
                 value_label=value_label,
             )
-        self._update_angle_error_profiles_window(show_window=profile_mode)
+        if profile_mode_requested:
+            self._update_angle_error_profiles_page()
+        else:
+            self._set_main_display_page("heatmap")
 
     def _update_q_space_display(self, *, force_show=False):
         if self.angle_space_result is None:
@@ -2556,11 +2613,17 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self._update_angle_space_display(force_show=True)
 
     def _on_angle_error_view_toggled(self, _enabled):
+        if _enabled:
+            intensity_index = self.angle_display_combo.findData("intensity_sem")
+            if intensity_index >= 0 and self.angle_display_combo.currentIndex() != intensity_index:
+                self.angle_display_combo.blockSignals(True)
+                self.angle_display_combo.setCurrentIndex(intensity_index)
+                self.angle_display_combo.blockSignals(False)
         self._sync_view_controls()
         if self.current_view_mode == "angle_space" and self.angle_space_result is not None:
             self._update_angle_space_display(force_show=True)
         else:
-            self._close_angle_error_profile_window()
+            self._set_main_display_page("heatmap")
 
     def _on_wavelength_changed(self, _value):
         self.q_space_result = None
@@ -2781,7 +2844,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if detector_data.ndim != 2:
             raise ValueError("Detector data must be a 2D array.")
         self._clear_roi_items()
-        self._close_angle_error_profile_window()
+        self._set_main_display_page("heatmap")
         self.detector_data = detector_data
         self.angle_space_result = None
         self.angle_space_error_result = None
@@ -2859,7 +2922,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def show_detector_view(self):
         if self.detector_data is None:
             return
-        self._close_angle_error_profile_window()
+        self._set_main_display_page("heatmap")
         self.current_view_mode = "detector"
         self.display_value_label = "Intensity"
         self.pick_center_button.blockSignals(True)
@@ -2903,7 +2966,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._schedule_cache_save()
 
     def show_q_space_view(self, q_image, qr, qz):
-        self._close_angle_error_profile_window()
+        self._set_main_display_page("heatmap")
         self.current_view_mode = "q_space"
         self.pick_center_button.blockSignals(True)
         self.pick_center_button.setChecked(False)
@@ -2964,7 +3027,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self._refresh_image_display()
 
     def on_scene_mouse_moved(self, event):
-        if self.data is None:
+        if self.data is None or self._coordinate_error_profiles_active():
             return
 
         position = event[0]
@@ -2983,7 +3046,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.pending_dirty = True
 
     def on_scene_mouse_clicked(self, event):
-        if self.data is None:
+        if self.data is None or self._coordinate_error_profiles_active():
             return
 
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
@@ -3012,6 +3075,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def render_pending_cursor(self):
         if self.data is None or not self.pending_dirty:
             return
+        if self._coordinate_error_profiles_active():
+            self.pending_dirty = False
+            return
 
         ix = self._index_from_edges(self.pending_x, self.display_x_edges)
         iy = self._index_from_edges(self.pending_y, self.display_y_edges)
@@ -3019,7 +3085,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.update_cursor(ix, iy)
 
     def update_cursor(self, ix, iy, force=False):
-        if self.data is None:
+        if self.data is None or self._coordinate_error_profiles_active():
             return
         if not force and ix == self.last_ix and iy == self.last_iy:
             return
@@ -3096,6 +3162,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def reset_zoom(self):
         if self.data is None:
             return
+        if self._coordinate_error_profiles_active():
+            self.angle_error_profiles_widget.reset_view()
+            return
         self.image_view.setRange(
             xRange=(float(self.display_x_edges[0]), float(self.display_x_edges[-1])),
             yRange=(float(self.display_y_edges[0]), float(self.display_y_edges[-1])),
@@ -3107,7 +3176,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             return
 
         default_stem = Path(self.filename).stem if self.filename else "osc_view"
-        if self.current_view_mode == "angle_space":
+        if self._coordinate_error_profiles_active():
+            default_stem = f"{default_stem}_phi_2theta_uncertainty_profiles"
+        elif self.current_view_mode == "angle_space":
             default_stem = f"{default_stem}_phi_2theta"
         elif self.current_view_mode == "q_space":
             default_stem = f"{default_stem}_q_space"
@@ -3118,6 +3189,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;TIFF (*.tif *.tiff);;All files (*)",
         )
         if not selected:
+            return
+
+        if self._coordinate_error_profiles_active():
+            self.angle_error_profiles_widget.grab().save(selected)
+            print(f"Saved image to {selected}")
             return
 
         from pyqtgraph.exporters import ImageExporter
