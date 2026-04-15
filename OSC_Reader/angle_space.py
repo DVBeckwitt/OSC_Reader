@@ -59,6 +59,85 @@ class DetectorCakeGeometry:
 
 
 @dataclass(frozen=True)
+class DetectorCakeGeometryUncertainty:
+    """Covariance of geometry parameters for coordinate calibration error.
+
+    Parameter order is ``(center_row_px, center_col_px, pixel_size_m, distance_m)``.
+    """
+
+    covariance: np.ndarray
+
+    def __post_init__(self) -> None:
+        cov = np.asarray(self.covariance, dtype=np.float64)
+        if cov.shape != (4, 4):
+            raise ValueError(
+                "geometry uncertainty covariance must have shape (4, 4) for "
+                "(center_row_px, center_col_px, pixel_size_m, distance_m)."
+            )
+        cov = 0.5 * (cov + cov.T)
+        if not np.all(np.isfinite(cov)):
+            raise ValueError("geometry uncertainty covariance must be finite.")
+        object.__setattr__(self, "covariance", cov)
+
+    @classmethod
+    def from_sigmas(
+        cls,
+        *,
+        sigma_center_row_px: float = 0.0,
+        sigma_center_col_px: float = 0.0,
+        sigma_pixel_size_m: float = 0.0,
+        sigma_distance_m: float = 0.0,
+    ) -> "DetectorCakeGeometryUncertainty":
+        return cls(
+            covariance=np.diag(
+                np.array(
+                    [
+                        float(sigma_center_row_px) ** 2,
+                        float(sigma_center_col_px) ** 2,
+                        float(sigma_pixel_size_m) ** 2,
+                        float(sigma_distance_m) ** 2,
+                    ],
+                    dtype=np.float64,
+                )
+            )
+        )
+
+
+@dataclass(frozen=True)
+class DetectorCakeCalibrationStats:
+    radial_sigma_deg: np.ndarray
+    azimuthal_sigma_deg: np.ndarray
+    radial_total_sigma_deg: np.ndarray
+    azimuthal_total_sigma_deg: np.ndarray
+    radial_label_total_sigma_deg: np.ndarray
+    azimuthal_label_total_sigma_deg: np.ndarray
+
+
+@dataclass(frozen=True)
+class DetectorCakeSubpixelErrorStats:
+    refinement_grid: int
+    radial_mean_error_deg: np.ndarray
+    azimuthal_mean_error_deg: np.ndarray
+    radial_sigma_error_deg: np.ndarray
+    azimuthal_sigma_error_deg: np.ndarray
+    radial_label_sigma_error_deg: np.ndarray
+    azimuthal_label_sigma_error_deg: np.ndarray
+
+
+@dataclass(frozen=True)
+class DetectorCakeCoordinateStats:
+    area_deg2: np.ndarray
+    radial_mean_deg: np.ndarray
+    azimuthal_mean_deg: np.ndarray
+    radial_sigma_deg: np.ndarray
+    azimuthal_sigma_deg: np.ndarray
+    radial_label_sigma_deg: np.ndarray
+    azimuthal_label_sigma_deg: np.ndarray
+    calibration: DetectorCakeCalibrationStats | None = None
+    subpixel_error: DetectorCakeSubpixelErrorStats | None = None
+
+
+@dataclass(frozen=True)
 class DetectorCakeResult:
     radial_deg: np.ndarray
     azimuthal_deg: np.ndarray
@@ -66,6 +145,7 @@ class DetectorCakeResult:
     sum_signal: np.ndarray
     sum_normalization: np.ndarray
     count: np.ndarray
+    coordinate_stats: DetectorCakeCoordinateStats | None = None
 
 
 @dataclass(frozen=True)
@@ -382,6 +462,621 @@ def _integrate_edge(box: np.ndarray, start0: float, start1: float, stop0: float,
                 box[int(stop0), height] += math.copysign(delta_a, segment_area)
                 abs_area -= delta_a
                 height += 1
+
+
+def _clip_polygon_halfplane(
+    polygon: list[tuple[float, float]],
+    *,
+    axis: int,
+    bound: float,
+    keep_lower: bool,
+) -> list[tuple[float, float]]:
+    if len(polygon) < 3:
+        return []
+
+    def _inside(point: tuple[float, float]) -> bool:
+        value = point[axis]
+        return value <= bound if keep_lower else value >= bound
+
+    def _intersect(
+        start: tuple[float, float],
+        stop: tuple[float, float],
+    ) -> tuple[float, float]:
+        sx, sy = start
+        ex, ey = stop
+        delta = (ex - sx) if axis == 0 else (ey - sy)
+        if delta == 0.0:
+            return (float(bound if axis == 0 else sx), float(bound if axis == 1 else sy))
+        factor = ((bound - sx) / delta) if axis == 0 else ((bound - sy) / delta)
+        if axis == 0:
+            return float(bound), float(sy + factor * (ey - sy))
+        return float(sx + factor * (ex - sx)), float(bound)
+
+    output: list[tuple[float, float]] = []
+    previous = polygon[-1]
+    previous_inside = _inside(previous)
+    for current in polygon:
+        current_inside = _inside(current)
+        if current_inside:
+            if not previous_inside:
+                output.append(_intersect(previous, current))
+            output.append((float(current[0]), float(current[1])))
+        elif previous_inside:
+            output.append(_intersect(previous, current))
+        previous = current
+        previous_inside = current_inside
+    return output
+
+
+def _clip_polygon_rectangle(
+    polygon: list[tuple[float, float]],
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+) -> list[tuple[float, float]]:
+    clipped = _clip_polygon_halfplane(polygon, axis=0, bound=float(x_min), keep_lower=False)
+    if len(clipped) < 3:
+        return []
+    clipped = _clip_polygon_halfplane(clipped, axis=0, bound=float(x_max), keep_lower=True)
+    if len(clipped) < 3:
+        return []
+    clipped = _clip_polygon_halfplane(clipped, axis=1, bound=float(y_min), keep_lower=False)
+    if len(clipped) < 3:
+        return []
+    clipped = _clip_polygon_halfplane(clipped, axis=1, bound=float(y_max), keep_lower=True)
+    if len(clipped) < 3:
+        return []
+    return clipped
+
+
+def _polygon_area_axis_moments(
+    polygon: list[tuple[float, float]],
+) -> tuple[float, float, float, float, float]:
+    if len(polygon) < 3:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    signed_area = 0.0
+    for index, (x0, y0) in enumerate(polygon):
+        x1, y1 = polygon[(index + 1) % len(polygon)]
+        signed_area += x0 * y1 - x1 * y0
+    signed_area *= 0.5
+    if (not math.isfinite(signed_area)) or abs(signed_area) <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    if signed_area < 0.0:
+        polygon = list(reversed(polygon))
+    area = 0.0
+    first_x = 0.0
+    first_y = 0.0
+    second_x = 0.0
+    second_y = 0.0
+    for index, (x0, y0) in enumerate(polygon):
+        x1, y1 = polygon[(index + 1) % len(polygon)]
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        first_x += (x0 + x1) * cross
+        first_y += (y0 + y1) * cross
+        second_x += (x0 * x0 + x0 * x1 + x1 * x1) * cross
+        second_y += (y0 * y0 + y0 * y1 + y1 * y1) * cross
+    area *= 0.5
+    if area <= 0.0 or (not math.isfinite(area)):
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    return area, first_x / 6.0, first_y / 6.0, second_x / 12.0, second_y / 12.0
+
+
+def _accumulate_coordinate_stats_quad(
+    y0: float,
+    y1: float,
+    x0: float,
+    x1: float,
+    distance: float,
+    radial: np.ndarray,
+    azimuthal: np.ndarray,
+    area_deg2: np.ndarray,
+    radial_first_moment: np.ndarray,
+    azimuthal_first_moment: np.ndarray,
+    radial_second_moment: np.ndarray,
+    azimuthal_second_moment: np.ndarray,
+) -> None:
+    delta0 = float(radial[1] - radial[0])
+    delta1 = float(azimuthal[1] - azimuthal[0])
+    pos0_min = float(radial[0] - 0.5 * delta0)
+    pos1_min = float(azimuthal[0] - 0.5 * delta1)
+    pos0_max = float(radial[-1] + 0.5 * delta0)
+    pos1_max = float(azimuthal[-1] + 0.5 * delta1)
+    pos0_maxin = _inverse_calc_upper_bound(pos0_max)
+    pos1_maxin = _inverse_calc_upper_bound(pos1_max)
+    a0, a1 = _corner_to_polar_deg(y0, x0, distance)
+    b0, b1 = _corner_to_polar_deg(y1, x0, distance)
+    c0, c1 = _corner_to_polar_deg(y1, x1, distance)
+    d0, d1 = _corner_to_polar_deg(y0, x1, distance)
+    area = _area4p(a0, a1, b0, b1, c0, c1, d0, d1)
+    if 360.0 > 0.0 and area > 0.0:
+        a1 = _recenter_helper(a1, 360.0, True)
+        b1 = _recenter_helper(b1, 360.0, True)
+        c1 = _recenter_helper(c1, 360.0, True)
+        d1 = _recenter_helper(d1, 360.0, True)
+        center1 = 0.25 * (a1 + b1 + c1 + d1)
+        if center1 > 180.0:
+            a1 -= 360.0
+            b1 -= 360.0
+            c1 -= 360.0
+            d1 -= 360.0
+    polygon_abs = [
+        (
+            (min(max(a0, pos0_min), pos0_maxin) - pos0_min) / delta0,
+            (min(max(a1, pos1_min), pos1_maxin) - pos1_min) / delta1,
+        ),
+        (
+            (min(max(b0, pos0_min), pos0_maxin) - pos0_min) / delta0,
+            (min(max(b1, pos1_min), pos1_maxin) - pos1_min) / delta1,
+        ),
+        (
+            (min(max(c0, pos0_min), pos0_maxin) - pos0_min) / delta0,
+            (min(max(c1, pos1_min), pos1_maxin) - pos1_min) / delta1,
+        ),
+        (
+            (min(max(d0, pos0_min), pos0_maxin) - pos0_min) / delta0,
+            (min(max(d1, pos1_min), pos1_maxin) - pos1_min) / delta1,
+        ),
+    ]
+    min0 = min(point[0] for point in polygon_abs)
+    max0 = max(point[0] for point in polygon_abs)
+    min1 = min(point[1] for point in polygon_abs)
+    max1 = max(point[1] for point in polygon_abs)
+    foffset0 = math.floor(min0)
+    foffset1 = math.floor(min1)
+    width0 = int(math.ceil(max0) - foffset0)
+    width1 = int(math.ceil(max1) - foffset1)
+    if width0 <= 0 or width1 <= 0:
+        return
+    ioffset0 = int(foffset0)
+    ioffset1 = int(foffset1)
+    scale_area = delta0 * delta1
+    for local0 in range(width0):
+        bin_rad = ioffset0 + local0
+        if bin_rad < 0 or bin_rad >= radial.size:
+            continue
+        cell_min0 = float(bin_rad)
+        cell_max0 = float(bin_rad + 1)
+        for local1 in range(width1):
+            bin_az = ioffset1 + local1
+            if bin_az < 0 or bin_az >= azimuthal.size:
+                continue
+            clipped = _clip_polygon_rectangle(
+                polygon_abs,
+                cell_min0,
+                cell_max0,
+                float(bin_az),
+                float(bin_az + 1),
+            )
+            area_uv, first_u, first_v, second_u, second_v = _polygon_area_axis_moments(clipped)
+            if area_uv <= 0.0:
+                continue
+            scaled_area = scale_area * area_uv
+            radial_first = scale_area * (pos0_min * area_uv + delta0 * first_u)
+            azimuthal_first = scale_area * (pos1_min * area_uv + delta1 * first_v)
+            radial_second = scale_area * (
+                (pos0_min * pos0_min * area_uv)
+                + (2.0 * pos0_min * delta0 * first_u)
+                + (delta0 * delta0 * second_u)
+            )
+            azimuthal_second = scale_area * (
+                (pos1_min * pos1_min * area_uv)
+                + (2.0 * pos1_min * delta1 * first_v)
+                + (delta1 * delta1 * second_v)
+            )
+            area_deg2[bin_az, bin_rad] += scaled_area
+            radial_first_moment[bin_az, bin_rad] += radial_first
+            azimuthal_first_moment[bin_az, bin_rad] += azimuthal_first
+            radial_second_moment[bin_az, bin_rad] += radial_second
+            azimuthal_second_moment[bin_az, bin_rad] += azimuthal_second
+
+
+def _accumulate_coordinate_stats_pixel(
+    row: int,
+    col: int,
+    row_edges: np.ndarray,
+    col_edges: np.ndarray,
+    distance: float,
+    radial: np.ndarray,
+    azimuthal: np.ndarray,
+    area_deg2: np.ndarray,
+    radial_first_moment: np.ndarray,
+    azimuthal_first_moment: np.ndarray,
+    radial_second_moment: np.ndarray,
+    azimuthal_second_moment: np.ndarray,
+    *,
+    subdivide_pixels: int = 1,
+) -> None:
+    y0 = float(row_edges[row])
+    y1 = float(row_edges[row + 1])
+    x0 = float(col_edges[col])
+    x1 = float(col_edges[col + 1])
+    subdivisions = max(1, int(subdivide_pixels))
+    if subdivisions == 1:
+        _accumulate_coordinate_stats_quad(
+            y0,
+            y1,
+            x0,
+            x1,
+            distance,
+            radial,
+            azimuthal,
+            area_deg2,
+            radial_first_moment,
+            azimuthal_first_moment,
+            radial_second_moment,
+            azimuthal_second_moment,
+        )
+        return
+    dy = (y1 - y0) / float(subdivisions)
+    dx = (x1 - x0) / float(subdivisions)
+    for sub_row in range(subdivisions):
+        sub_y0 = y0 + float(sub_row) * dy
+        sub_y1 = sub_y0 + dy
+        for sub_col in range(subdivisions):
+            sub_x0 = x0 + float(sub_col) * dx
+            sub_x1 = sub_x0 + dx
+            _accumulate_coordinate_stats_quad(
+                sub_y0,
+                sub_y1,
+                sub_x0,
+                sub_x1,
+                distance,
+                radial,
+                azimuthal,
+                area_deg2,
+                radial_first_moment,
+                azimuthal_first_moment,
+                radial_second_moment,
+                azimuthal_second_moment,
+            )
+
+
+def _resolve_image_shape(
+    image_or_shape: np.ndarray | tuple[int, int] | list[int],
+) -> tuple[int, int]:
+    if isinstance(image_or_shape, (tuple, list)):
+        if len(image_or_shape) != 2:
+            raise ValueError("image_or_shape must provide exactly two dimensions.")
+        return int(image_or_shape[0]), int(image_or_shape[1])
+    image = np.asarray(image_or_shape)
+    if image.ndim != 2:
+        raise ValueError("image_or_shape must be a 2D array or a (rows, cols) shape tuple.")
+    return int(image.shape[0]), int(image.shape[1])
+
+
+def _compute_coordinate_moment_arrays(
+    image_or_shape: np.ndarray | tuple[int, int] | list[int],
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+    *,
+    mask: np.ndarray | None = None,
+    rows: np.ndarray | None = None,
+    cols: np.ndarray | None = None,
+    subdivide_pixels: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    shape = _resolve_image_shape(image_or_shape)
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    azimuthal = np.asarray(azimuthal_deg, dtype=np.float64)
+    _validate_axes(radial, azimuthal)
+    if mask is None:
+        mask_array = np.zeros((1, 1), dtype=np.int8)
+        has_mask = False
+    else:
+        mask_array = np.asarray(mask, dtype=np.int8)
+        if mask_array.shape != shape:
+            raise ValueError("mask must match image shape.")
+        has_mask = True
+    rows_array, cols_array, use_selection = _prepare_selection(shape, rows, cols)
+    row_edges, col_edges = _row_col_edges(shape, geometry)
+    area_deg2 = np.zeros((azimuthal.size, radial.size), dtype=np.float64)
+    radial_first_moment = np.zeros_like(area_deg2)
+    azimuthal_first_moment = np.zeros_like(area_deg2)
+    radial_second_moment = np.zeros_like(area_deg2)
+    azimuthal_second_moment = np.zeros_like(area_deg2)
+    subdivisions = max(1, int(subdivide_pixels))
+
+    if use_selection:
+        for selection_index in range(int(rows_array.size)):
+            row = int(rows_array[selection_index])
+            col = int(cols_array[selection_index])
+            if has_mask and mask_array[row, col] != 0:
+                continue
+            _accumulate_coordinate_stats_pixel(
+                row,
+                col,
+                row_edges,
+                col_edges,
+                float(geometry.distance_m),
+                radial,
+                azimuthal,
+                area_deg2,
+                radial_first_moment,
+                azimuthal_first_moment,
+                radial_second_moment,
+                azimuthal_second_moment,
+                subdivide_pixels=subdivisions,
+            )
+    else:
+        for row in range(shape[0]):
+            for col in range(shape[1]):
+                if has_mask and mask_array[row, col] != 0:
+                    continue
+                _accumulate_coordinate_stats_pixel(
+                    row,
+                    col,
+                    row_edges,
+                    col_edges,
+                    float(geometry.distance_m),
+                    radial,
+                    azimuthal,
+                    area_deg2,
+                    radial_first_moment,
+                    azimuthal_first_moment,
+                    radial_second_moment,
+                    azimuthal_second_moment,
+                    subdivide_pixels=subdivisions,
+                )
+    return (
+        area_deg2,
+        radial_first_moment,
+        azimuthal_first_moment,
+        radial_second_moment,
+        azimuthal_second_moment,
+    )
+
+
+def _finalize_coordinate_statistics(
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    area_deg2: np.ndarray,
+    radial_first_moment: np.ndarray,
+    azimuthal_first_moment: np.ndarray,
+    radial_second_moment: np.ndarray,
+    azimuthal_second_moment: np.ndarray,
+    *,
+    calibration: DetectorCakeCalibrationStats | None = None,
+    subpixel_error: DetectorCakeSubpixelErrorStats | None = None,
+) -> DetectorCakeCoordinateStats:
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    azimuthal = np.asarray(azimuthal_deg, dtype=np.float64)
+    radial_mean = np.full_like(area_deg2, np.nan, dtype=np.float64)
+    azimuthal_mean = np.full_like(area_deg2, np.nan, dtype=np.float64)
+    radial_sigma = np.full_like(area_deg2, np.nan, dtype=np.float64)
+    azimuthal_sigma = np.full_like(area_deg2, np.nan, dtype=np.float64)
+    radial_label_sigma = np.full_like(area_deg2, np.nan, dtype=np.float64)
+    azimuthal_label_sigma = np.full_like(area_deg2, np.nan, dtype=np.float64)
+    valid = area_deg2 > 0.0
+    if np.any(valid):
+        radial_mean[valid] = radial_first_moment[valid] / area_deg2[valid]
+        azimuthal_mean[valid] = azimuthal_first_moment[valid] / area_deg2[valid]
+        radial_variance = (radial_second_moment[valid] / area_deg2[valid]) - (radial_mean[valid] ** 2)
+        azimuthal_variance = (azimuthal_second_moment[valid] / area_deg2[valid]) - (azimuthal_mean[valid] ** 2)
+        radial_sigma[valid] = np.sqrt(np.maximum(radial_variance, 0.0))
+        azimuthal_sigma[valid] = np.sqrt(np.maximum(azimuthal_variance, 0.0))
+        radial_centers_2d = np.broadcast_to(radial[np.newaxis, :], area_deg2.shape)
+        azimuthal_centers_2d = np.broadcast_to(azimuthal[:, np.newaxis], area_deg2.shape)
+        radial_label_variance = (
+            (radial_second_moment[valid] / area_deg2[valid])
+            - (2.0 * radial_centers_2d[valid] * radial_first_moment[valid] / area_deg2[valid])
+            + (radial_centers_2d[valid] ** 2)
+        )
+        azimuthal_label_variance = (
+            (azimuthal_second_moment[valid] / area_deg2[valid])
+            - (2.0 * azimuthal_centers_2d[valid] * azimuthal_first_moment[valid] / area_deg2[valid])
+            + (azimuthal_centers_2d[valid] ** 2)
+        )
+        radial_label_sigma[valid] = np.sqrt(np.maximum(radial_label_variance, 0.0))
+        azimuthal_label_sigma[valid] = np.sqrt(np.maximum(azimuthal_label_variance, 0.0))
+    return DetectorCakeCoordinateStats(
+        area_deg2=area_deg2,
+        radial_mean_deg=radial_mean,
+        azimuthal_mean_deg=azimuthal_mean,
+        radial_sigma_deg=radial_sigma,
+        azimuthal_sigma_deg=azimuthal_sigma,
+        radial_label_sigma_deg=radial_label_sigma,
+        azimuthal_label_sigma_deg=azimuthal_label_sigma,
+        calibration=calibration,
+        subpixel_error=subpixel_error,
+    )
+
+
+def _compute_calibration_coordinate_statistics(
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+    coordinate_stats: DetectorCakeCoordinateStats,
+    geometry_uncertainty: DetectorCakeGeometryUncertainty,
+) -> DetectorCakeCalibrationStats:
+    radial_centers = np.broadcast_to(
+        np.asarray(radial_deg, dtype=np.float64)[None, :],
+        coordinate_stats.area_deg2.shape,
+    )
+    azimuthal_centers = np.broadcast_to(
+        np.asarray(azimuthal_deg, dtype=np.float64)[:, None],
+        coordinate_stats.area_deg2.shape,
+    )
+    radial_eval = np.where(
+        np.isfinite(coordinate_stats.radial_mean_deg),
+        coordinate_stats.radial_mean_deg,
+        radial_centers,
+    )
+    azimuthal_eval = np.where(
+        np.isfinite(coordinate_stats.azimuthal_mean_deg),
+        coordinate_stats.azimuthal_mean_deg,
+        azimuthal_centers,
+    )
+
+    t_rad = np.deg2rad(radial_eval)
+    phi_rad = np.deg2rad(azimuthal_eval)
+    distance = float(geometry.distance_m)
+    pixel_size = float(geometry.pixel_size_m)
+    rho = distance * np.tan(t_rad)
+    x = rho * np.cos(phi_rad)
+    y = rho * np.sin(phi_rad)
+    rho2 = x * x + y * y
+    denom = distance * distance + rho2
+
+    radial_sigma = np.full_like(coordinate_stats.area_deg2, np.nan, dtype=np.float64)
+    azimuthal_sigma = np.full_like(coordinate_stats.area_deg2, np.nan, dtype=np.float64)
+    radial_total = np.full_like(coordinate_stats.area_deg2, np.nan, dtype=np.float64)
+    azimuthal_total = np.full_like(coordinate_stats.area_deg2, np.nan, dtype=np.float64)
+    radial_label_total = np.full_like(coordinate_stats.area_deg2, np.nan, dtype=np.float64)
+    azimuthal_label_total = np.full_like(coordinate_stats.area_deg2, np.nan, dtype=np.float64)
+
+    valid = (
+        (coordinate_stats.area_deg2 > 0.0)
+        & np.isfinite(rho)
+        & np.isfinite(denom)
+        & (rho > 1.0e-15)
+        & (denom > 0.0)
+        & np.isfinite(pixel_size)
+        & (pixel_size > 0.0)
+        & np.isfinite(distance)
+        & (distance > 0.0)
+    )
+    if np.any(valid):
+        dtdx = np.zeros_like(coordinate_stats.area_deg2, dtype=np.float64)
+        dtdy = np.zeros_like(coordinate_stats.area_deg2, dtype=np.float64)
+        dtdd = np.zeros_like(coordinate_stats.area_deg2, dtype=np.float64)
+        dphidx = np.zeros_like(coordinate_stats.area_deg2, dtype=np.float64)
+        dphidy = np.zeros_like(coordinate_stats.area_deg2, dtype=np.float64)
+        dtdx[valid] = distance * x[valid] / (rho[valid] * denom[valid])
+        dtdy[valid] = distance * y[valid] / (rho[valid] * denom[valid])
+        dtdd[valid] = -rho[valid] / denom[valid]
+        dphidx[valid] = -y[valid] / rho2[valid]
+        dphidy[valid] = x[valid] / rho2[valid]
+
+        jt = np.zeros(coordinate_stats.area_deg2.shape + (4,), dtype=np.float64)
+        jphi = np.zeros_like(jt)
+        jt[..., 0] = dtdy * pixel_size
+        jt[..., 1] = -dtdx * pixel_size
+        jt[..., 2] = (dtdx * x + dtdy * y) / pixel_size
+        jt[..., 3] = dtdd
+        jphi[..., 0] = dphidy * pixel_size
+        jphi[..., 1] = -dphidx * pixel_size
+        jt_deg = np.rad2deg(jt)
+        jphi_deg = np.rad2deg(jphi)
+
+        covariance = np.asarray(geometry_uncertainty.covariance, dtype=np.float64)
+        jt_valid = jt_deg[valid]
+        jphi_valid = jphi_deg[valid]
+        radial_var = np.einsum("ni,ij,nj->n", jt_valid, covariance, jt_valid)
+        azimuthal_var = np.einsum("ni,ij,nj->n", jphi_valid, covariance, jphi_valid)
+        radial_sigma[valid] = np.sqrt(np.maximum(radial_var, 0.0))
+        azimuthal_sigma[valid] = np.sqrt(np.maximum(azimuthal_var, 0.0))
+
+        combine = valid & np.isfinite(coordinate_stats.radial_sigma_deg) & np.isfinite(radial_sigma)
+        radial_total[combine] = np.sqrt(coordinate_stats.radial_sigma_deg[combine] ** 2 + radial_sigma[combine] ** 2)
+        combine = valid & np.isfinite(coordinate_stats.azimuthal_sigma_deg) & np.isfinite(azimuthal_sigma)
+        azimuthal_total[combine] = np.sqrt(
+            coordinate_stats.azimuthal_sigma_deg[combine] ** 2 + azimuthal_sigma[combine] ** 2
+        )
+        combine = valid & np.isfinite(coordinate_stats.radial_label_sigma_deg) & np.isfinite(radial_sigma)
+        radial_label_total[combine] = np.sqrt(
+            coordinate_stats.radial_label_sigma_deg[combine] ** 2 + radial_sigma[combine] ** 2
+        )
+        combine = valid & np.isfinite(coordinate_stats.azimuthal_label_sigma_deg) & np.isfinite(azimuthal_sigma)
+        azimuthal_label_total[combine] = np.sqrt(
+            coordinate_stats.azimuthal_label_sigma_deg[combine] ** 2 + azimuthal_sigma[combine] ** 2
+        )
+
+    return DetectorCakeCalibrationStats(
+        radial_sigma_deg=radial_sigma,
+        azimuthal_sigma_deg=azimuthal_sigma,
+        radial_total_sigma_deg=radial_total,
+        azimuthal_total_sigma_deg=azimuthal_total,
+        radial_label_total_sigma_deg=radial_label_total,
+        azimuthal_label_total_sigma_deg=azimuthal_label_total,
+    )
+
+
+def _compute_subpixel_refinement_error(
+    base_stats: DetectorCakeCoordinateStats,
+    refined_stats: DetectorCakeCoordinateStats,
+    *,
+    refinement_grid: int,
+) -> DetectorCakeSubpixelErrorStats:
+    return DetectorCakeSubpixelErrorStats(
+        refinement_grid=int(refinement_grid),
+        radial_mean_error_deg=np.abs(refined_stats.radial_mean_deg - base_stats.radial_mean_deg),
+        azimuthal_mean_error_deg=np.abs(refined_stats.azimuthal_mean_deg - base_stats.azimuthal_mean_deg),
+        radial_sigma_error_deg=np.abs(refined_stats.radial_sigma_deg - base_stats.radial_sigma_deg),
+        azimuthal_sigma_error_deg=np.abs(refined_stats.azimuthal_sigma_deg - base_stats.azimuthal_sigma_deg),
+        radial_label_sigma_error_deg=np.abs(
+            refined_stats.radial_label_sigma_deg - base_stats.radial_label_sigma_deg
+        ),
+        azimuthal_label_sigma_error_deg=np.abs(
+            refined_stats.azimuthal_label_sigma_deg - base_stats.azimuthal_label_sigma_deg
+        ),
+    )
+
+
+def compute_detector_to_cake_coordinate_statistics(
+    image_or_shape: np.ndarray | tuple[int, int] | list[int],
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+    *,
+    mask: np.ndarray | None = None,
+    rows: np.ndarray | None = None,
+    cols: np.ndarray | None = None,
+    geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
+    numerical_subpixel_grid: int | None = None,
+) -> DetectorCakeCoordinateStats:
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    azimuthal = np.asarray(azimuthal_deg, dtype=np.float64)
+    base_moments = _compute_coordinate_moment_arrays(
+        image_or_shape,
+        radial,
+        azimuthal,
+        geometry,
+        mask=mask,
+        rows=rows,
+        cols=cols,
+        subdivide_pixels=1,
+    )
+    base_stats = _finalize_coordinate_statistics(radial, azimuthal, *base_moments)
+
+    calibration_stats = None
+    if geometry_uncertainty is not None:
+        calibration_stats = _compute_calibration_coordinate_statistics(
+            radial,
+            azimuthal,
+            geometry,
+            base_stats,
+            geometry_uncertainty,
+        )
+
+    subpixel_error = None
+    refinement_grid = 1 if numerical_subpixel_grid is None else int(numerical_subpixel_grid)
+    if refinement_grid > 1:
+        refined_moments = _compute_coordinate_moment_arrays(
+            image_or_shape,
+            radial,
+            azimuthal,
+            geometry,
+            mask=mask,
+            rows=rows,
+            cols=cols,
+            subdivide_pixels=refinement_grid,
+        )
+        refined_stats = _finalize_coordinate_statistics(radial, azimuthal, *refined_moments)
+        subpixel_error = _compute_subpixel_refinement_error(
+            base_stats,
+            refined_stats,
+            refinement_grid=refinement_grid,
+        )
+
+    return _finalize_coordinate_statistics(
+        radial,
+        azimuthal,
+        *base_moments,
+        calibration=calibration_stats,
+        subpixel_error=subpixel_error,
+    )
 
 
 def _accumulate_pixel_python(
@@ -1066,6 +1761,9 @@ def integrate_detector_to_cake_exact(
     cols: np.ndarray | None = None,
     engine: str = "auto",
     workers: int | str | None = "auto",
+    compute_coordinate_statistics: bool = False,
+    geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
+    numerical_subpixel_grid: int | None = None,
 ) -> DetectorCakeResult:
     signal, norm, radial, azimuthal, mask_array, has_mask = _prepare_inputs(
         image,
@@ -1113,6 +1811,19 @@ def integrate_detector_to_cake_exact(
     intensity = np.zeros_like(sum_signal, dtype=np.float32)
     valid = sum_normalization > 0.0
     intensity[valid] = (sum_signal[valid] / sum_normalization[valid]).astype(np.float32, copy=False)
+    coordinate_stats = None
+    if compute_coordinate_statistics:
+        coordinate_stats = compute_detector_to_cake_coordinate_statistics(
+            signal.shape,
+            radial,
+            azimuthal,
+            geometry,
+            mask=mask_array if has_mask else None,
+            rows=rows_array if use_selection else None,
+            cols=cols_array if use_selection else None,
+            geometry_uncertainty=geometry_uncertainty,
+            numerical_subpixel_grid=numerical_subpixel_grid,
+        )
     return DetectorCakeResult(
         radial_deg=np.array(radial, copy=True),
         azimuthal_deg=np.array(azimuthal, copy=True),
@@ -1120,6 +1831,7 @@ def integrate_detector_to_cake_exact(
         sum_signal=sum_signal,
         sum_normalization=sum_normalization,
         count=count,
+        coordinate_stats=coordinate_stats,
     )
 
 
@@ -1183,6 +1895,13 @@ def convert_image_to_phi_2theta_space(
     correct_solid_angle: bool = False,
     engine: str = DEFAULT_ANGLE_SPACE_ENGINE,
     workers: int | str | None = DEFAULT_ANGLE_SPACE_WORKERS,
+    compute_coordinate_statistics: bool = False,
+    geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
+    sigma_center_row_px: float = 0.0,
+    sigma_center_col_px: float = 0.0,
+    sigma_pixel_size_mm: float = 0.0,
+    sigma_distance_mm: float = 0.0,
+    numerical_subpixel_grid: int | None = None,
 ) -> DetectorCakeResult:
     signal = np.asarray(image)
     if signal.ndim != 2:
@@ -1214,6 +1933,27 @@ def convert_image_to_phi_2theta_space(
     normalization = None
     if correct_solid_angle:
         normalization = flat_solid_angle_normalization(signal.shape, geometry)
+    built_uncertainty = geometry_uncertainty
+    provided_sigma = any(
+        float(value) != 0.0
+        for value in (
+            sigma_center_row_px,
+            sigma_center_col_px,
+            sigma_pixel_size_mm,
+            sigma_distance_mm,
+        )
+    )
+    if built_uncertainty is not None and provided_sigma:
+        raise ValueError(
+            "Pass either geometry_uncertainty or explicit sigma_* values, not both."
+        )
+    if built_uncertainty is None and provided_sigma:
+        built_uncertainty = DetectorCakeGeometryUncertainty.from_sigmas(
+            sigma_center_row_px=float(sigma_center_row_px),
+            sigma_center_col_px=float(sigma_center_col_px),
+            sigma_pixel_size_m=float(sigma_pixel_size_mm) / 1000.0,
+            sigma_distance_m=float(sigma_distance_mm) / 1000.0,
+        )
     return integrate_detector_to_cake_exact(
         signal,
         radial_deg,
@@ -1222,6 +1962,9 @@ def convert_image_to_phi_2theta_space(
         normalization=normalization,
         engine=engine,
         workers=workers,
+        compute_coordinate_statistics=compute_coordinate_statistics,
+        geometry_uncertainty=built_uncertainty,
+        numerical_subpixel_grid=numerical_subpixel_grid,
     )
 
 
@@ -1383,11 +2126,16 @@ __all__ = [
     "DEFAULT_PHI_ZERO_DIRECTION",
     "DEFAULT_TWO_THETA_MAX_DEG",
     "DEFAULT_TWO_THETA_MIN_DEG",
+    "DetectorCakeCalibrationStats",
+    "DetectorCakeCoordinateStats",
     "DetectorCakeGeometry",
+    "DetectorCakeGeometryUncertainty",
     "DetectorCakeResult",
+    "DetectorCakeSubpixelErrorStats",
     "QSpaceResult",
     "PHI_ZERO_DIRECTIONS",
     "build_angle_axes",
+    "compute_detector_to_cake_coordinate_statistics",
     "convert_phi_2theta_to_qr_qz_space",
     "convert_image_to_phi_2theta_space",
     "flat_solid_angle_normalization",
