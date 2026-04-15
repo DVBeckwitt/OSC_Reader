@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import replace
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from .angle_space import (
     DEFAULT_GUI_PHI_MIN_DEG,
     DEFAULT_PHI_ZERO_DIRECTION,
     PHI_ZERO_DIRECTIONS,
+    _compute_intensity_sem,
     convert_phi_2theta_to_qr_qz_space,
     convert_image_to_phi_2theta_space,
     prepare_gui_phi_display_data,
@@ -668,6 +670,37 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         mode = self.angle_display_combo.currentData()
         return str(mode) if mode else "intensity_sem"
 
+    def _ensure_angle_space_error_result(self):
+        if self.angle_space_result is None:
+            raise ValueError("Angle-space result is unavailable.")
+        base_result = self.angle_space_result
+        error_result = self.angle_space_error_result
+        intensity_sem = base_result.intensity_sem
+        coordinate_stats = base_result.coordinate_stats
+        if error_result is not None:
+            if intensity_sem is None:
+                intensity_sem = error_result.intensity_sem
+            if coordinate_stats is None:
+                coordinate_stats = error_result.coordinate_stats
+        if intensity_sem is None:
+            intensity_sem = _compute_intensity_sem(
+                base_result.sum_normalization,
+                base_result.count,
+                variance_per_effective_pixel=1.0,
+            )
+        if (
+            error_result is not None
+            and error_result.intensity_sem is intensity_sem
+            and error_result.coordinate_stats is coordinate_stats
+        ):
+            return error_result
+        self.angle_space_error_result = replace(
+            base_result,
+            intensity_sem=intensity_sem,
+            coordinate_stats=coordinate_stats,
+        )
+        return self.angle_space_error_result
+
     def _angle_space_display_values(self):
         if self.angle_space_result is None:
             raise ValueError("Angle-space result is unavailable.")
@@ -675,14 +708,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if mode == "intensity":
             values = self.angle_space_result.intensity
         else:
-            if self.angle_space_error_result is None:
-                raise ValueError("Angle-space error metrics are unavailable.")
+            error_result = self._ensure_angle_space_error_result()
             if mode == "intensity_sem":
-                values = self.angle_space_error_result.intensity_sem
+                values = error_result.intensity_sem
                 if values is None:
                     raise ValueError("Angle-space intensity error is unavailable.")
                 return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
-            coordinate_stats = self.angle_space_error_result.coordinate_stats
+            coordinate_stats = error_result.coordinate_stats
             if coordinate_stats is None:
                 raise ValueError("Analytic coordinate uncertainty is unavailable for this conversion.")
             if mode == "theta_sigma":
@@ -2221,10 +2253,17 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             zero_direction=self._current_phi_zero_direction(),
         )
         self.angle_space_cake = cake
-        if self.angle_error_view_button.isChecked() and self.angle_space_error_result is None:
-            if not self._converting:
-                self._start_conversion(target_view="angle_space_error")
-            return
+        if self.angle_error_view_button.isChecked():
+            mode = self._current_angle_display_mode()
+            if mode == "intensity_sem":
+                self._ensure_angle_space_error_result()
+            elif (
+                self.angle_space_error_result is None
+                or self.angle_space_error_result.coordinate_stats is None
+            ):
+                if not self._converting:
+                    self._start_conversion(target_view="angle_space_error")
+                return
         display_values, value_label = self._angle_space_display_values()
         display_result = (
             self.angle_space_result
