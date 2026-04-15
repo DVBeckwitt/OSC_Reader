@@ -18,6 +18,8 @@ from OSC_Reader.OSC_Viewer import (
 from OSC_Reader.angle_space import (
     DetectorCakeCoordinateStats,
     DetectorCakeResult,
+    fast_display_sigma_maps,
+    prepare_gui_phi_display_data,
 )
 
 
@@ -135,6 +137,117 @@ class ViewerErrorHelperTests(unittest.TestCase):
         self.assertEqual(_normalize_angle_display_mode("theta_sigma"), "coordinate_profiles")
         self.assertEqual(_normalize_angle_display_mode("phi_sigma"), "coordinate_profiles")
         self.assertEqual(_normalize_angle_display_mode("intensity_sem"), "intensity_sem")
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_coordinate_profile_metric_reports_available_without_exact_stats(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.angle_space_result = self._base_result()
+            viewer.angle_space_error_result = None
+
+            self.assertTrue(viewer._angle_error_metrics_available("coordinate_profiles"))
+            self.assertFalse(viewer._angle_error_metrics_available("intensity_sem"))
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_angle_error_profiles_fall_back_to_fast_sigma_maps_when_stats_missing(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            base_result = self._base_result()
+            viewer.angle_space_result = base_result
+            viewer.angle_space_error_result = None
+            viewer.pixel_size_spin.setValue(0.1)
+            viewer.distance_spin.setValue(200.0)
+
+            expected_theta_source, expected_phi_source = fast_display_sigma_maps(
+                base_result,
+                pixel_size_m=viewer.pixel_size_spin.value() * 1.0e-3,
+                distance_m=viewer.distance_spin.value() * 1.0e-3,
+            )
+            expected_theta_map, expected_radial_deg, _ = prepare_gui_phi_display_data(
+                base_result,
+                expected_theta_source,
+                zero_direction=viewer._current_phi_zero_direction(),
+            )
+            expected_phi_map, _, expected_phi_deg = prepare_gui_phi_display_data(
+                base_result,
+                expected_phi_source,
+                zero_direction=viewer._current_phi_zero_direction(),
+            )
+
+            with mock.patch.object(
+                viewer,
+                "_ensure_angle_space_coordinate_stats",
+                side_effect=AssertionError("coordinate stats should stay lazy"),
+            ):
+                radial_deg, theta_profile, phi_deg, phi_profile, _ = viewer._angle_error_profiles()
+
+            np.testing.assert_allclose(radial_deg, expected_radial_deg, rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(
+                theta_profile,
+                _nanmean_profile(expected_theta_map, axis=0),
+                rtol=1.0e-6,
+                atol=0.0,
+            )
+            np.testing.assert_allclose(phi_deg, expected_phi_deg, rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(
+                phi_profile,
+                _nanmean_profile(expected_phi_map, axis=1),
+                rtol=1.0e-6,
+                atol=0.0,
+                equal_nan=True,
+            )
+            self.assertIs(viewer.angle_space_error_result, base_result)
+            self.assertIsNone(viewer.angle_space_error_result.coordinate_stats)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_angle_error_profiles_prefer_precomputed_coordinate_stats(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            base_result = self._base_result()
+            error_result = replace(base_result, coordinate_stats=self._coordinate_stats())
+            viewer.angle_space_result = base_result
+            viewer.angle_space_error_result = error_result
+
+            expected_theta_map, expected_radial_deg, _ = prepare_gui_phi_display_data(
+                error_result,
+                error_result.coordinate_stats.radial_sigma_deg,
+                zero_direction=viewer._current_phi_zero_direction(),
+            )
+            expected_phi_map, _, expected_phi_deg = prepare_gui_phi_display_data(
+                error_result,
+                error_result.coordinate_stats.azimuthal_sigma_deg,
+                zero_direction=viewer._current_phi_zero_direction(),
+            )
+
+            with mock.patch(
+                "OSC_Reader.OSC_Viewer.fast_display_sigma_maps",
+                side_effect=AssertionError("fast sigma path should stay unused"),
+            ):
+                radial_deg, theta_profile, phi_deg, phi_profile, _ = viewer._angle_error_profiles()
+
+            np.testing.assert_allclose(radial_deg, expected_radial_deg, rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(
+                theta_profile,
+                _nanmean_profile(expected_theta_map, axis=0),
+                rtol=0.0,
+                atol=0.0,
+            )
+            np.testing.assert_allclose(phi_deg, expected_phi_deg, rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(
+                phi_profile,
+                _nanmean_profile(expected_phi_map, axis=1),
+                rtol=0.0,
+                atol=0.0,
+            )
+        finally:
+            viewer.close()
+            self._app.processEvents()
 
     @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
     def test_merged_profile_mode_uses_inline_uncertainty_profile_page(self):

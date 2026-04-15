@@ -19,6 +19,7 @@ from .angle_space import (
     compute_detector_to_cake_coordinate_statistics,
     convert_phi_2theta_to_qr_qz_space,
     convert_image_to_phi_2theta_space,
+    fast_display_sigma_maps,
     prepare_gui_phi_display_data,
     prepare_gui_phi_display,
     warm_angle_space_engine,
@@ -924,28 +925,32 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 or (error_result is not None and error_result.intensity_sem is not None)
             )
         if mode == "coordinate_profiles":
-            return (
-                base_result.coordinate_stats is not None
-                or (error_result is not None and error_result.coordinate_stats is not None)
-            )
+            return True
         return True
 
     def _angle_error_profiles(self):
-        error_result = self._ensure_angle_space_error_result(require_coordinate_stats=True)
+        error_result = self._ensure_angle_space_error_result()
         coordinate_stats = error_result.coordinate_stats
-        if coordinate_stats is None:
-            raise ValueError("Angle-space coordinate statistics are unavailable.")
+        if coordinate_stats is not None:
+            theta_sigma_source = coordinate_stats.radial_sigma_deg
+            phi_sigma_source = coordinate_stats.azimuthal_sigma_deg
+        else:
+            theta_sigma_source, phi_sigma_source = fast_display_sigma_maps(
+                error_result,
+                pixel_size_m=self.pixel_size_spin.value() * 1.0e-3,
+                distance_m=self.distance_spin.value() * 1.0e-3,
+            )
 
         theta_sigma_map, radial_deg, _ = prepare_gui_phi_display_data(
             error_result,
-            coordinate_stats.radial_sigma_deg,
+            theta_sigma_source,
             phi_min_deg=DEFAULT_GUI_PHI_MIN_DEG,
             phi_max_deg=DEFAULT_GUI_PHI_MAX_DEG,
             zero_direction=self._current_phi_zero_direction(),
         )
         phi_sigma_map, _, phi_deg = prepare_gui_phi_display_data(
             error_result,
-            coordinate_stats.azimuthal_sigma_deg,
+            phi_sigma_source,
             phi_min_deg=DEFAULT_GUI_PHI_MIN_DEG,
             phi_max_deg=DEFAULT_GUI_PHI_MAX_DEG,
             zero_direction=self._current_phi_zero_direction(),
