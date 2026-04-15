@@ -582,10 +582,6 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._roi_window_pending_initial_draw = False
         self._cache_state = _load_viewer_cache()
         self._restoring_cache = False
-        self._cached_view_mode = "detector"
-        self._cached_angle_error_view = False
-        self._pending_restore_after_load = False
-        self._pending_restore_angle_error_view = False
 
         self._build_ui()
         self._cache_save_timer = QtCore.QTimer(self)
@@ -1447,10 +1443,6 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                     self.angle_display_combo,
                     display.get("angle_display_mode"),
                 )
-                cached_view_mode = self._coerce_choice(display.get("view_mode"))
-                if cached_view_mode in {"detector", "angle_space", "q_space"}:
-                    self._cached_view_mode = cached_view_mode
-                self._cached_angle_error_view = bool(display.get("angle_error_view"))
 
             if isinstance(profiles, dict):
                 self._set_toggle_checked(
@@ -1511,23 +1503,6 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         finally:
             self._restoring_cache = False
 
-    def _restore_cached_view_after_load(self):
-        self._pending_restore_after_load = False
-        self._pending_restore_angle_error_view = False
-
-        if self.detector_data is None:
-            return
-
-        if self._cached_view_mode == "angle_space":
-            self._pending_restore_angle_error_view = bool(self._cached_angle_error_view)
-            self.convert_active_image()
-            return
-        if self._cached_view_mode == "q_space":
-            self.convert_active_image_to_q_space()
-            return
-
-        self._schedule_cache_save(delay_ms=0)
-
     def _collect_cache_state(self):
         viewer_state = _viewer_cache_state(self._cache_state).copy()
         last_file = str(self.filename) if self.filename else viewer_state.get("last_file")
@@ -1548,9 +1523,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             "azimuth_bins": self.azimuth_bins_spin.value(),
         }
         viewer_state["display"] = {
-            "view_mode": self.current_view_mode,
             "angle_display_mode": self.angle_display_combo.currentData(),
-            "angle_error_view": self.angle_error_view_button.isChecked(),
         }
         viewer_state["profiles"] = {
             "image_log_enabled": self.image_log_button.isChecked(),
@@ -2414,9 +2387,6 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.angle_space_result = payload["result"]
         self.angle_space_error_result = None
         self.q_space_result = None
-        if self._conversion_target_view == "angle_space" and self._pending_restore_angle_error_view:
-            self._set_toggle_checked(self.angle_error_view_button, True)
-            self._pending_restore_angle_error_view = False
         if self._conversion_target_view == "q_space":
             self._update_q_space_display(force_show=True)
         else:
@@ -2497,7 +2467,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         print("Preparing profile sampling grid...")
         self.set_data(data)
         self._apply_cached_loaded_file_state()
-        self._pending_restore_after_load = True
+        self._schedule_cache_save(delay_ms=0)
         print("Profile sampling ready.")
 
     def _on_loader_failed(self, filename, message):
@@ -2510,10 +2480,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._set_interaction_enabled(self.data is not None)
         self._loader_worker = None
         self._loader_thread = None
-        if self._pending_restore_after_load:
-            QtCore.QTimer.singleShot(0, self._restore_cached_view_after_load)
-        else:
-            self._schedule_cache_save(delay_ms=0)
+        self._schedule_cache_save(delay_ms=0)
 
     def open_file_dialog(self):
         if self._loading or self._converting:
