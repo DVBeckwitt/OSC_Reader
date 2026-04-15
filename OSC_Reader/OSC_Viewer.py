@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -30,6 +31,67 @@ except Exception:  # pragma: no cover - depends on optional GUI stack
 
 
 _ACTIVE_WINDOWS = []
+_VIEWER_CACHE_VERSION = 1
+_VIEWER_CACHE_FILENAME = ".osc_reader_cache.json"
+
+
+def _viewer_cache_path():
+    return Path(__file__).resolve().parent.parent / _VIEWER_CACHE_FILENAME
+
+
+def _viewer_cache_state(cache_state):
+    viewer_state = cache_state.get("viewer")
+    return viewer_state if isinstance(viewer_state, dict) else {}
+
+
+def _load_viewer_cache():
+    try:
+        payload = json.loads(_viewer_cache_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_viewer_cache(cache_state):
+    path = _viewer_cache_path()
+    temp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(cache_state, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _cached_viewer_file(cache_state):
+    viewer_state = _viewer_cache_state(cache_state)
+    filename = viewer_state.get("last_file")
+    if not filename:
+        return None
+    candidate = Path(str(filename))
+    return str(candidate) if candidate.is_file() else None
+
+
+def _cached_viewer_start_dir(cache_state):
+    viewer_state = _viewer_cache_state(cache_state)
+    candidates = [viewer_state.get("last_open_dir")]
+    last_file = viewer_state.get("last_file")
+    if last_file:
+        candidates.append(Path(str(last_file)).parent)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate)
+        if candidate_path.is_dir():
+            return str(candidate_path)
+    return str(Path.cwd())
 
 
 if QtCore is not None:
@@ -518,8 +580,19 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._updating_roi = False
         self.roi_profile_window = None
         self._roi_window_pending_initial_draw = False
+        self._cache_state = _load_viewer_cache()
+        self._restoring_cache = False
+        self._cached_view_mode = "detector"
+        self._cached_angle_error_view = False
+        self._pending_restore_after_load = False
+        self._pending_restore_angle_error_view = False
 
         self._build_ui()
+        self._cache_save_timer = QtCore.QTimer(self)
+        self._cache_save_timer.setSingleShot(True)
+        self._cache_save_timer.setInterval(200)
+        self._cache_save_timer.timeout.connect(self._save_cache_now)
+        self._apply_cached_ui_state()
         self._start_angle_space_warmup()
         if filename:
             QtCore.QTimer.singleShot(0, lambda: self.load_file(filename))
@@ -1289,6 +1362,218 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def _set_status_message(self, message):
         self.statusBar().showMessage(str(message))
 
+    @staticmethod
+    def _coerce_float(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and np.isfinite(value):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _coerce_int(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and np.isfinite(value):
+            return int(round(float(value)))
+        return None
+
+    @staticmethod
+    def _coerce_choice(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+
+    def _set_toggle_checked(self, button, checked):
+        button.blockSignals(True)
+        button.setChecked(bool(checked))
+        button.blockSignals(False)
+
+    def _set_combo_text_if_present(self, combo, text):
+        choice = self._coerce_choice(text)
+        if choice is None:
+            return
+        index = combo.findText(choice)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _set_combo_data_if_present(self, combo, value):
+        choice = self._coerce_choice(value)
+        if choice is None:
+            return
+        index = combo.findData(choice)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _apply_cached_ui_state(self):
+        viewer_state = _viewer_cache_state(self._cache_state)
+        geometry = viewer_state.get("geometry")
+        sampling = viewer_state.get("sampling")
+        display = viewer_state.get("display")
+        profiles = viewer_state.get("profiles")
+
+        self._restoring_cache = True
+        try:
+            if isinstance(geometry, dict):
+                distance_mm = self._coerce_float(geometry.get("distance_mm"))
+                if distance_mm is not None:
+                    self.distance_spin.setValue(distance_mm)
+                pixel_size_mm = self._coerce_float(geometry.get("pixel_size_mm"))
+                if pixel_size_mm is not None:
+                    self.pixel_size_spin.setValue(pixel_size_mm)
+                wavelength = self._coerce_float(geometry.get("wavelength_angstrom"))
+                if wavelength is not None:
+                    self.wavelength_spin.setValue(wavelength)
+                incident_angle = self._coerce_float(geometry.get("incident_angle_deg"))
+                if incident_angle is not None:
+                    self.incident_angle_spin.setValue(incident_angle)
+                phi_zero_direction = self._coerce_choice(geometry.get("phi_zero_direction"))
+                self._set_combo_text_if_present(
+                    self.phi_zero_direction_combo,
+                    phi_zero_direction.title() if phi_zero_direction else None,
+                )
+
+            if isinstance(sampling, dict):
+                radial_bins = self._coerce_int(sampling.get("radial_bins"))
+                if radial_bins is not None:
+                    self.radial_bins_spin.setValue(radial_bins)
+                azimuth_bins = self._coerce_int(sampling.get("azimuth_bins"))
+                if azimuth_bins is not None:
+                    self.azimuth_bins_spin.setValue(azimuth_bins)
+
+            if isinstance(display, dict):
+                self._set_combo_data_if_present(
+                    self.angle_display_combo,
+                    display.get("angle_display_mode"),
+                )
+                cached_view_mode = self._coerce_choice(display.get("view_mode"))
+                if cached_view_mode in {"detector", "angle_space", "q_space"}:
+                    self._cached_view_mode = cached_view_mode
+                self._cached_angle_error_view = bool(display.get("angle_error_view"))
+
+            if isinstance(profiles, dict):
+                self._set_toggle_checked(
+                    self.image_log_button,
+                    profiles.get("image_log_enabled", False),
+                )
+                self._set_toggle_checked(
+                    self.bottom_log_button,
+                    profiles.get("bottom_log_enabled", False),
+                )
+                self._set_toggle_checked(
+                    self.left_log_button,
+                    profiles.get("left_log_enabled", False),
+                )
+        finally:
+            self._restoring_cache = False
+
+        self.set_image_log_mode(self.image_log_button.isChecked())
+        self.set_bottom_log_mode(self.bottom_log_button.isChecked())
+        self.set_left_log_mode(self.left_log_button.isChecked())
+
+    def _apply_cached_loaded_file_state(self):
+        viewer_state = _viewer_cache_state(self._cache_state)
+        geometry = viewer_state.get("geometry")
+        sampling = viewer_state.get("sampling")
+
+        self._restoring_cache = True
+        try:
+            if isinstance(sampling, dict):
+                radial_bins = self._coerce_int(sampling.get("radial_bins"))
+                if radial_bins is not None:
+                    self.radial_bins_spin.setValue(
+                        int(
+                            np.clip(
+                                radial_bins,
+                                self.radial_bins_spin.minimum(),
+                                self.radial_bins_spin.maximum(),
+                            )
+                        )
+                    )
+                azimuth_bins = self._coerce_int(sampling.get("azimuth_bins"))
+                if azimuth_bins is not None:
+                    self.azimuth_bins_spin.setValue(
+                        int(
+                            np.clip(
+                                azimuth_bins,
+                                self.azimuth_bins_spin.minimum(),
+                                self.azimuth_bins_spin.maximum(),
+                            )
+                        )
+                    )
+
+            if isinstance(geometry, dict):
+                center_row = self._coerce_float(geometry.get("center_row_px"))
+                center_col = self._coerce_float(geometry.get("center_col_px"))
+                if center_row is not None and center_col is not None:
+                    self._set_beam_center(center_row, center_col)
+        finally:
+            self._restoring_cache = False
+
+    def _restore_cached_view_after_load(self):
+        self._pending_restore_after_load = False
+        self._pending_restore_angle_error_view = False
+
+        if self.detector_data is None:
+            return
+
+        if self._cached_view_mode == "angle_space":
+            self._pending_restore_angle_error_view = bool(self._cached_angle_error_view)
+            self.convert_active_image()
+            return
+        if self._cached_view_mode == "q_space":
+            self.convert_active_image_to_q_space()
+            return
+
+        self._schedule_cache_save(delay_ms=0)
+
+    def _collect_cache_state(self):
+        viewer_state = _viewer_cache_state(self._cache_state).copy()
+        last_file = str(self.filename) if self.filename else viewer_state.get("last_file")
+        if last_file:
+            viewer_state["last_file"] = last_file
+            viewer_state["last_open_dir"] = str(Path(last_file).parent)
+        viewer_state["geometry"] = {
+            "center_col_px": self.beam_center_col,
+            "center_row_px": self.beam_center_row,
+            "distance_mm": self.distance_spin.value(),
+            "pixel_size_mm": self.pixel_size_spin.value(),
+            "wavelength_angstrom": self.wavelength_spin.value(),
+            "incident_angle_deg": self.incident_angle_spin.value(),
+            "phi_zero_direction": self._current_phi_zero_direction(),
+        }
+        viewer_state["sampling"] = {
+            "radial_bins": self.radial_bins_spin.value(),
+            "azimuth_bins": self.azimuth_bins_spin.value(),
+        }
+        viewer_state["display"] = {
+            "view_mode": self.current_view_mode,
+            "angle_display_mode": self.angle_display_combo.currentData(),
+            "angle_error_view": self.angle_error_view_button.isChecked(),
+        }
+        viewer_state["profiles"] = {
+            "image_log_enabled": self.image_log_button.isChecked(),
+            "bottom_log_enabled": self.bottom_log_button.isChecked(),
+            "left_log_enabled": self.left_log_button.isChecked(),
+        }
+        return {
+            "version": _VIEWER_CACHE_VERSION,
+            "viewer": viewer_state,
+        }
+
+    def _save_cache_now(self):
+        if self._restoring_cache:
+            return
+        self._cache_state = self._collect_cache_state()
+        _write_viewer_cache(self._cache_state)
+
+    def _schedule_cache_save(self, *_args, delay_ms=None):
+        if self._restoring_cache or self._loading or self._cache_save_timer is None:
+            return
+        interval = self._cache_save_timer.interval() if delay_ms is None else max(0, int(delay_ms))
+        self._cache_save_timer.start(interval)
+
     def _sync_view_controls(self):
         button_map = {
             "detector": self.detector_view_button,
@@ -1708,6 +1993,23 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self._on_phi_zero_direction_changed
         )
         self.angle_display_combo.currentIndexChanged.connect(self._on_angle_display_mode_changed)
+        for widget in (
+            self.center_col_spin,
+            self.center_row_spin,
+            self.distance_spin,
+            self.pixel_size_spin,
+            self.wavelength_spin,
+            self.incident_angle_spin,
+            self.radial_bins_spin,
+            self.azimuth_bins_spin,
+        ):
+            widget.valueChanged.connect(self._schedule_cache_save)
+        self.phi_zero_direction_combo.currentTextChanged.connect(self._schedule_cache_save)
+        self.angle_display_combo.currentIndexChanged.connect(self._schedule_cache_save)
+        self.image_log_button.toggled.connect(self._schedule_cache_save)
+        self.bottom_log_button.toggled.connect(self._schedule_cache_save)
+        self.left_log_button.toggled.connect(self._schedule_cache_save)
+        self.angle_error_view_button.toggled.connect(self._schedule_cache_save)
 
         self.mouse_proxy = pg.SignalProxy(
             self.image_plot.scene().sigMouseMoved,
@@ -1763,6 +2065,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.center_row_spin.blockSignals(False)
             self.center_col_spin.blockSignals(False)
         self._update_beam_center_marker()
+        self._schedule_cache_save()
 
     def _update_beam_center_marker(self):
         visible = (
@@ -2111,6 +2414,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.angle_space_result = payload["result"]
         self.angle_space_error_result = None
         self.q_space_result = None
+        if self._conversion_target_view == "angle_space" and self._pending_restore_angle_error_view:
+            self._set_toggle_checked(self.angle_error_view_button, True)
+            self._pending_restore_angle_error_view = False
         if self._conversion_target_view == "q_space":
             self._update_q_space_display(force_show=True)
         else:
@@ -2190,6 +2496,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         print("Data loaded successfully.")
         print("Preparing profile sampling grid...")
         self.set_data(data)
+        self._apply_cached_loaded_file_state()
+        self._pending_restore_after_load = True
         print("Profile sampling ready.")
 
     def _on_loader_failed(self, filename, message):
@@ -2202,11 +2510,18 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._set_interaction_enabled(self.data is not None)
         self._loader_worker = None
         self._loader_thread = None
+        if self._pending_restore_after_load:
+            QtCore.QTimer.singleShot(0, self._restore_cached_view_after_load)
+        else:
+            self._schedule_cache_save(delay_ms=0)
 
     def open_file_dialog(self):
         if self._loading or self._converting:
             return
-        start_dir = str(Path(self.filename).parent) if self.filename else str(Path.cwd())
+        if self.filename:
+            start_dir = str(Path(self.filename).parent)
+        else:
+            start_dir = _cached_viewer_start_dir(self._cache_state)
         selected, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select a detector image",
@@ -2321,6 +2636,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             "X pixels",
             "Y pixels",
         )
+        self._schedule_cache_save()
 
     def show_angle_space_view(self, cake, radial_deg, phi_deg, *, value_label="Intensity"):
         self.current_view_mode = "angle_space"
@@ -2345,6 +2661,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             DEFAULT_GUI_PHI_MAX_DEG,
             padding=0.0,
         )
+        self._schedule_cache_save()
 
     def show_q_space_view(self, q_image, qr, qz):
         self.current_view_mode = "q_space"
@@ -2360,6 +2677,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             "qr (1/Å)",
             "qz (1/Å)",
         )
+        self._schedule_cache_save()
 
     def prepare_profile_cache(self):
         self.step_x = max(1, self.width // self.MAX_PROFILE_POINTS)
@@ -2572,6 +2890,12 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         exporter.export(selected)
         print(f"Saved image to {selected}")
 
+    def closeEvent(self, event):
+        if self._cache_save_timer is not None and self._cache_save_timer.isActive():
+            self._cache_save_timer.stop()
+        self._save_cache_now()
+        super().closeEvent(event)
+
 
 def _require_qt_viewer_stack():
     if pg is None or QtWidgets is None or QtCore is None:
@@ -2595,11 +2919,14 @@ def visualize_detector_data(filename=None):
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
 
+    cache_state = _load_viewer_cache()
+    if filename is None:
+        filename = _cached_viewer_file(cache_state)
     if filename is None:
         selected, _ = QtWidgets.QFileDialog.getOpenFileName(
             None,
             "Select a detector image",
-            str(Path.cwd()),
+            _cached_viewer_start_dir(cache_state),
             get_detector_file_dialog_filter(),
         )
         filename = selected

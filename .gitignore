@@ -33,6 +33,7 @@ develop-eggs
 lib
 lib64
 __pycache__
+.osc_reader_cache.json
 
 # Installer logs
 pip-log.txt
