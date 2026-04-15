@@ -146,6 +146,7 @@ class DetectorCakeResult:
     sum_normalization: np.ndarray
     count: np.ndarray
     coordinate_stats: DetectorCakeCoordinateStats | None = None
+    intensity_sem: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -883,6 +884,111 @@ def _finalize_coordinate_statistics(
     )
 
 
+def _analytic_coordinate_sigma_deg(
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+) -> tuple[np.ndarray, np.ndarray]:
+    radial_eval = np.asarray(radial_deg, dtype=np.float64)
+    azimuthal_eval = np.asarray(azimuthal_deg, dtype=np.float64)
+    radial_sigma = np.full_like(radial_eval, np.nan, dtype=np.float64)
+    azimuthal_sigma = np.full_like(radial_eval, np.nan, dtype=np.float64)
+
+    distance = float(geometry.distance_m)
+    pixel_size = float(geometry.pixel_size_m)
+    valid = (
+        np.isfinite(radial_eval)
+        & np.isfinite(azimuthal_eval)
+        & np.isfinite(distance)
+        & np.isfinite(pixel_size)
+        & (distance > 0.0)
+        & (pixel_size > 0.0)
+    )
+    if not np.any(valid):
+        return radial_sigma, azimuthal_sigma
+
+    t_rad = np.deg2rad(radial_eval[valid])
+    phi_rad = np.deg2rad(azimuthal_eval[valid])
+    cos_t = np.cos(t_rad)
+    tan_t = np.tan(t_rad)
+    cos_phi = np.cos(phi_rad)
+    sin_phi = np.sin(phi_rad)
+    pixel_variance = (pixel_size * pixel_size) / 12.0
+    distance_sq = distance * distance
+
+    radial_var = ((cos_t ** 4) / distance_sq) * (
+        (pixel_variance * cos_phi * cos_phi) + (pixel_variance * sin_phi * sin_phi)
+    )
+    radial_sigma[valid] = np.rad2deg(np.sqrt(np.maximum(radial_var, 0.0)))
+
+    phi_valid = np.abs(tan_t) > 1.0e-15
+    if np.any(phi_valid):
+        phi_var = (
+            (pixel_variance * sin_phi[phi_valid] * sin_phi[phi_valid])
+            + (pixel_variance * cos_phi[phi_valid] * cos_phi[phi_valid])
+        ) / (distance_sq * (tan_t[phi_valid] ** 2))
+        azimuthal_sigma_valid = np.rad2deg(np.sqrt(np.maximum(phi_var, 0.0)))
+        azimuthal_sigma_flat = azimuthal_sigma.reshape(-1)
+        valid_indices = np.flatnonzero(valid.reshape(-1))
+        azimuthal_sigma_flat[valid_indices[phi_valid]] = azimuthal_sigma_valid
+    return radial_sigma, azimuthal_sigma
+
+
+def _apply_analytic_coordinate_uncertainty(
+    stats: DetectorCakeCoordinateStats,
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+    *,
+    calibration: DetectorCakeCalibrationStats | None = None,
+    subpixel_error: DetectorCakeSubpixelErrorStats | None = None,
+) -> DetectorCakeCoordinateStats:
+    radial_centers = np.broadcast_to(
+        np.asarray(radial_deg, dtype=np.float64)[None, :],
+        stats.area_deg2.shape,
+    )
+    azimuthal_centers = np.broadcast_to(
+        np.asarray(azimuthal_deg, dtype=np.float64)[:, None],
+        stats.area_deg2.shape,
+    )
+    radial_eval = np.where(
+        np.isfinite(stats.radial_mean_deg),
+        stats.radial_mean_deg,
+        radial_centers,
+    )
+    azimuthal_eval = np.where(
+        np.isfinite(stats.azimuthal_mean_deg),
+        stats.azimuthal_mean_deg,
+        azimuthal_centers,
+    )
+    radial_sigma, azimuthal_sigma = _analytic_coordinate_sigma_deg(
+        radial_eval,
+        azimuthal_eval,
+        geometry,
+    )
+    radial_label_sigma, azimuthal_label_sigma = _analytic_coordinate_sigma_deg(
+        radial_centers,
+        azimuthal_centers,
+        geometry,
+    )
+    valid = stats.area_deg2 > 0.0
+    radial_sigma[~valid] = np.nan
+    azimuthal_sigma[~valid] = np.nan
+    radial_label_sigma[~valid] = np.nan
+    azimuthal_label_sigma[~valid] = np.nan
+    return DetectorCakeCoordinateStats(
+        area_deg2=stats.area_deg2,
+        radial_mean_deg=stats.radial_mean_deg,
+        azimuthal_mean_deg=stats.azimuthal_mean_deg,
+        radial_sigma_deg=radial_sigma,
+        azimuthal_sigma_deg=azimuthal_sigma,
+        radial_label_sigma_deg=radial_label_sigma,
+        azimuthal_label_sigma_deg=azimuthal_label_sigma,
+        calibration=calibration,
+        subpixel_error=subpixel_error,
+    )
+
+
 def _compute_calibration_coordinate_statistics(
     radial_deg: np.ndarray,
     azimuthal_deg: np.ndarray,
@@ -1014,6 +1120,27 @@ def _compute_subpixel_refinement_error(
     )
 
 
+def _compute_intensity_sem(
+    sum_normalization: np.ndarray,
+    count: np.ndarray,
+    *,
+    variance_per_effective_pixel: float,
+) -> np.ndarray:
+    sem = np.full_like(sum_normalization, np.nan, dtype=np.float64)
+    variance = float(variance_per_effective_pixel)
+    if not math.isfinite(variance) or variance < 0.0:
+        raise ValueError("variance_per_effective_pixel must be finite and >= 0.")
+    valid = (
+        np.isfinite(sum_normalization)
+        & np.isfinite(count)
+        & (sum_normalization > 0.0)
+        & (count > 0.0)
+    )
+    if np.any(valid):
+        sem[valid] = np.sqrt(variance * count[valid]) / sum_normalization[valid]
+    return sem
+
+
 def compute_detector_to_cake_coordinate_statistics(
     image_or_shape: np.ndarray | tuple[int, int] | list[int],
     radial_deg: np.ndarray,
@@ -1038,7 +1165,13 @@ def compute_detector_to_cake_coordinate_statistics(
         cols=cols,
         subdivide_pixels=1,
     )
-    base_stats = _finalize_coordinate_statistics(radial, azimuthal, *base_moments)
+    base_polygon_stats = _finalize_coordinate_statistics(radial, azimuthal, *base_moments)
+    base_stats = _apply_analytic_coordinate_uncertainty(
+        base_polygon_stats,
+        radial,
+        azimuthal,
+        geometry,
+    )
 
     calibration_stats = None
     if geometry_uncertainty is not None:
@@ -1065,15 +1198,16 @@ def compute_detector_to_cake_coordinate_statistics(
         )
         refined_stats = _finalize_coordinate_statistics(radial, azimuthal, *refined_moments)
         subpixel_error = _compute_subpixel_refinement_error(
-            base_stats,
+            base_polygon_stats,
             refined_stats,
             refinement_grid=refinement_grid,
         )
 
-    return _finalize_coordinate_statistics(
+    return _apply_analytic_coordinate_uncertainty(
+        base_polygon_stats,
         radial,
         azimuthal,
-        *base_moments,
+        geometry,
         calibration=calibration_stats,
         subpixel_error=subpixel_error,
     )
@@ -1762,8 +1896,10 @@ def integrate_detector_to_cake_exact(
     engine: str = "auto",
     workers: int | str | None = "auto",
     compute_coordinate_statistics: bool = False,
+    compute_intensity_sem: bool = False,
     geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
     numerical_subpixel_grid: int | None = None,
+    intensity_variance_per_effective_pixel: float = 1.0,
 ) -> DetectorCakeResult:
     signal, norm, radial, azimuthal, mask_array, has_mask = _prepare_inputs(
         image,
@@ -1811,6 +1947,13 @@ def integrate_detector_to_cake_exact(
     intensity = np.zeros_like(sum_signal, dtype=np.float32)
     valid = sum_normalization > 0.0
     intensity[valid] = (sum_signal[valid] / sum_normalization[valid]).astype(np.float32, copy=False)
+    intensity_sem = None
+    if compute_intensity_sem:
+        intensity_sem = _compute_intensity_sem(
+            sum_normalization,
+            count,
+            variance_per_effective_pixel=float(intensity_variance_per_effective_pixel),
+        )
     coordinate_stats = None
     if compute_coordinate_statistics:
         coordinate_stats = compute_detector_to_cake_coordinate_statistics(
@@ -1831,6 +1974,7 @@ def integrate_detector_to_cake_exact(
         sum_signal=sum_signal,
         sum_normalization=sum_normalization,
         count=count,
+        intensity_sem=intensity_sem,
         coordinate_stats=coordinate_stats,
     )
 
@@ -1896,12 +2040,14 @@ def convert_image_to_phi_2theta_space(
     engine: str = DEFAULT_ANGLE_SPACE_ENGINE,
     workers: int | str | None = DEFAULT_ANGLE_SPACE_WORKERS,
     compute_coordinate_statistics: bool = False,
+    compute_intensity_sem: bool = False,
     geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
     sigma_center_row_px: float = 0.0,
     sigma_center_col_px: float = 0.0,
     sigma_pixel_size_mm: float = 0.0,
     sigma_distance_mm: float = 0.0,
     numerical_subpixel_grid: int | None = None,
+    intensity_variance_per_effective_pixel: float = 1.0,
 ) -> DetectorCakeResult:
     signal = np.asarray(image)
     if signal.ndim != 2:
@@ -1963,8 +2109,10 @@ def convert_image_to_phi_2theta_space(
         engine=engine,
         workers=workers,
         compute_coordinate_statistics=compute_coordinate_statistics,
+        compute_intensity_sem=compute_intensity_sem,
         geometry_uncertainty=built_uncertainty,
         numerical_subpixel_grid=numerical_subpixel_grid,
+        intensity_variance_per_effective_pixel=float(intensity_variance_per_effective_pixel),
     )
 
 
@@ -1992,12 +2140,12 @@ def warm_angle_space_engine(*, workers: int | str | None = 1) -> None:
         _ANGLE_SPACE_WARMED = True
 
 
-def prepare_gui_phi_display(
+def _prepare_gui_phi_indices(
     result: DetectorCakeResult,
     *,
-    phi_min_deg: float = DEFAULT_GUI_PHI_MIN_DEG,
-    phi_max_deg: float = DEFAULT_GUI_PHI_MAX_DEG,
-    zero_direction: str = DEFAULT_PHI_ZERO_DIRECTION,
+    phi_min_deg: float,
+    phi_max_deg: float,
+    zero_direction: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gui_phi = _wrap_signed_degrees(
         _phi_zero_azimuth_deg(zero_direction)
@@ -2005,12 +2153,48 @@ def prepare_gui_phi_display(
     )
     order = np.argsort(gui_phi)
     gui_phi = gui_phi[order]
-    cake = np.asarray(result.intensity, dtype=np.float64)[order, :]
     if float(phi_min_deg) <= float(phi_max_deg):
         mask = (gui_phi >= float(phi_min_deg)) & (gui_phi <= float(phi_max_deg))
     else:
         mask = (gui_phi >= float(phi_min_deg)) | (gui_phi <= float(phi_max_deg))
-    return cake[mask, :], np.asarray(result.radial_deg, dtype=np.float64), gui_phi[mask]
+    return order, mask, gui_phi
+
+
+def prepare_gui_phi_display_data(
+    result: DetectorCakeResult,
+    values: np.ndarray,
+    *,
+    phi_min_deg: float = DEFAULT_GUI_PHI_MIN_DEG,
+    phi_max_deg: float = DEFAULT_GUI_PHI_MAX_DEG,
+    zero_direction: str = DEFAULT_PHI_ZERO_DIRECTION,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    data = np.asarray(values, dtype=np.float64)
+    expected_shape = np.asarray(result.intensity).shape
+    if data.shape != expected_shape:
+        raise ValueError("values must match result.intensity shape.")
+    order, mask, gui_phi = _prepare_gui_phi_indices(
+        result,
+        phi_min_deg=phi_min_deg,
+        phi_max_deg=phi_max_deg,
+        zero_direction=zero_direction,
+    )
+    return data[order, :][mask, :], np.asarray(result.radial_deg, dtype=np.float64), gui_phi[mask]
+
+
+def prepare_gui_phi_display(
+    result: DetectorCakeResult,
+    *,
+    phi_min_deg: float = DEFAULT_GUI_PHI_MIN_DEG,
+    phi_max_deg: float = DEFAULT_GUI_PHI_MAX_DEG,
+    zero_direction: str = DEFAULT_PHI_ZERO_DIRECTION,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return prepare_gui_phi_display_data(
+        result,
+        result.intensity,
+        phi_min_deg=phi_min_deg,
+        phi_max_deg=phi_max_deg,
+        zero_direction=zero_direction,
+    )
 
 
 def convert_phi_2theta_to_qr_qz_space(

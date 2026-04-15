@@ -14,6 +14,7 @@ from .angle_space import (
     PHI_ZERO_DIRECTIONS,
     convert_phi_2theta_to_qr_qz_space,
     convert_image_to_phi_2theta_space,
+    prepare_gui_phi_display_data,
     prepare_gui_phi_display,
     warm_angle_space_engine,
 )
@@ -79,6 +80,19 @@ _ROI_COLORS = (
     "#ffd166",
 )
 
+_ANGLE_SPACE_ERROR_DISPLAY_MODES = (
+    ("intensity_sem", "Intensity Error"),
+    ("theta_sigma", "2θ Uncertainty"),
+    ("phi_sigma", "φ Uncertainty"),
+)
+
+_ANGLE_SPACE_DISPLAY_LABELS = {
+    "intensity": "Intensity",
+    "intensity_sem": "Intensity Error (SEM)",
+    "theta_sigma": "2θ Uncertainty (deg)",
+    "phi_sigma": "φ Uncertainty (deg)",
+}
+
 
 if QtCore is not None and _QtSignal is not None:
     class _OSCLoadWorker(QtCore.QObject):
@@ -117,6 +131,7 @@ if QtCore is not None and _QtSignal is not None:
             center_col_px,
             radial_bins,
             azimuth_bins,
+            compute_error_metrics=False,
         ):
             super().__init__()
             self.image = np.asarray(image)
@@ -126,6 +141,7 @@ if QtCore is not None and _QtSignal is not None:
             self.center_col_px = float(center_col_px)
             self.radial_bins = int(radial_bins)
             self.azimuth_bins = int(azimuth_bins)
+            self.compute_error_metrics = bool(compute_error_metrics)
 
         def run(self):
             try:
@@ -137,6 +153,8 @@ if QtCore is not None and _QtSignal is not None:
                     center_col_px=self.center_col_px,
                     radial_bins=self.radial_bins,
                     azimuth_bins=self.azimuth_bins,
+                    compute_coordinate_statistics=self.compute_error_metrics,
+                    compute_intensity_sem=self.compute_error_metrics,
                 )
             except Exception as exc:  # pragma: no cover - runtime/UI path
                 self.failed.emit(str(exc))
@@ -452,6 +470,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.data = None
         self.detector_data = None
         self.angle_space_result = None
+        self.angle_space_error_result = None
         self.angle_space_cake = None
         self.q_space_result = None
         self.height = 0
@@ -465,6 +484,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.display_y_edges = np.array([], dtype=np.float64)
         self.display_x_label = "X pixels"
         self.display_y_label = "Y pixels"
+        self.display_value_label = "Intensity"
 
         self.pending_x = None
         self.pending_y = None
@@ -559,6 +579,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
     def _compute_axis_range(self, values, log_enabled):
         values = np.asarray(values, dtype=np.float64)
+        values = values[np.isfinite(values)]
         if values.size == 0:
             if log_enabled:
                 return self.LOG_EPS, self.LOG_EPS * 10.0
@@ -570,6 +591,47 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 return self.LOG_EPS, self.LOG_EPS * 10.0
             return self._safe_limits_log(np.min(positive), np.max(positive))
         return self._safe_limits_linear(np.min(values), np.max(values))
+
+    def _current_angle_display_mode(self):
+        error_button = getattr(self, "angle_error_view_button", None)
+        if error_button is None or not error_button.isChecked():
+            return "intensity"
+        mode = self.angle_display_combo.currentData()
+        return str(mode) if mode else "intensity_sem"
+
+    def _angle_space_display_values(self):
+        if self.angle_space_result is None:
+            raise ValueError("Angle-space result is unavailable.")
+        mode = self._current_angle_display_mode()
+        if mode == "intensity":
+            values = self.angle_space_result.intensity
+        else:
+            if self.angle_space_error_result is None:
+                raise ValueError("Angle-space error metrics are unavailable.")
+            if mode == "intensity_sem":
+                values = self.angle_space_error_result.intensity_sem
+                if values is None:
+                    raise ValueError("Angle-space intensity error is unavailable.")
+                return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
+            coordinate_stats = self.angle_space_error_result.coordinate_stats
+            if coordinate_stats is None:
+                raise ValueError("Analytic coordinate uncertainty is unavailable for this conversion.")
+            if mode == "theta_sigma":
+                values = coordinate_stats.radial_sigma_deg
+            elif mode == "phi_sigma":
+                values = coordinate_stats.azimuthal_sigma_deg
+            else:
+                values = self.angle_space_result.intensity
+                mode = "intensity"
+        if values is None:
+            raise ValueError("Selected display data is unavailable.")
+        return np.asarray(values, dtype=np.float64), _ANGLE_SPACE_DISPLAY_LABELS.get(mode, "Intensity")
+
+    @staticmethod
+    def _format_display_value(value):
+        if np.isfinite(value):
+            return f"{float(value):.4g}"
+        return "n/a"
 
     @staticmethod
     def _coord_edges(coords):
@@ -607,7 +669,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         return f"Beam center: ({self.beam_center_col:.2f}, {self.beam_center_row:.2f}) px"
 
     def _roi_supported_in_current_view(self):
-        return self.current_view_mode == "angle_space" and self.data is not None
+        return (
+            self.current_view_mode == "angle_space"
+            and self.data is not None
+            and self._current_angle_display_mode() == "intensity"
+        )
 
     def _visible_roi_items(self):
         return [item for item in self.roi_items if item.isVisible()]
@@ -1027,12 +1093,19 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         sample_step_x = max(1, array.shape[1] // sample_target)
         sample_step_y = max(1, array.shape[0] // sample_target)
         sample = array[::sample_step_y, ::sample_step_x]
-        sample_min = float(np.min(sample))
-        sample_max = float(np.max(sample))
+        finite_sample = sample[np.isfinite(sample)]
+        if finite_sample.size == 0:
+            finite_sample = array[np.isfinite(array)]
+        if finite_sample.size == 0:
+            return 0.0, 1.0
+        sample_min = float(np.min(finite_sample))
+        sample_max = float(np.max(finite_sample))
         if np.isclose(sample_min, sample_max):
             # Fallback for pathological cases.
-            sample_min = float(np.min(array))
-            sample_max = float(np.max(array))
+            finite_full = array[np.isfinite(array)]
+            if finite_full.size != 0:
+                sample_min = float(np.min(finite_full))
+                sample_max = float(np.max(finite_full))
         return sample_min, sample_max
 
     def _image_display_data(self):
@@ -1230,23 +1303,35 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
         pick_visible = self.detector_data is not None and self.current_view_mode == "detector"
         roi_visible = self._roi_supported_in_current_view()
+        angle_error_visible = (
+            self.angle_space_result is not None and self.current_view_mode == "angle_space"
+        )
         if not roi_visible and self.roi_button.isChecked():
             self.roi_button.blockSignals(True)
             self.roi_button.setChecked(False)
             self.roi_button.blockSignals(False)
+        if not angle_error_visible and self.angle_error_view_button.isChecked():
+            self.angle_error_view_button.blockSignals(True)
+            self.angle_error_view_button.setChecked(False)
+            self.angle_error_view_button.blockSignals(False)
         self.pick_center_button.setVisible(pick_visible)
         self.roi_button.setVisible(roi_visible)
-        self.context_tools_frame.setVisible(pick_visible or roi_visible)
+        self.angle_error_view_button.setVisible(angle_error_visible)
+        self.context_tools_frame.setVisible(pick_visible or roi_visible or angle_error_visible)
         self._set_roi_overlay_visible(roi_visible and self.roi_button.isChecked())
         if not roi_visible:
             self._close_roi_profile_window()
-        self.status_view_label.setText(
-            {
-                "detector": "View: Detector",
-                "angle_space": "View: φ/2θ",
-                "q_space": "View: q-space",
-            }.get(self.current_view_mode, "View: Detector")
-        )
+        error_metric_enabled = angle_error_visible and self.angle_error_view_button.isChecked()
+        self.angle_display_label.setEnabled(error_metric_enabled)
+        self.angle_display_combo.setEnabled(error_metric_enabled)
+        status_text = {
+            "detector": "View: Detector",
+            "angle_space": "View: φ/2θ",
+            "q_space": "View: q-space",
+        }.get(self.current_view_mode, "View: Detector")
+        if error_metric_enabled:
+            status_text = "View: φ/2θ Error"
+        self.status_view_label.setText(status_text)
 
     def _request_view_mode(self, view_mode):
         if self._loading or self._converting or self.detector_data is None:
@@ -1362,8 +1447,16 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             shortcut="A",
             minimum_width=88,
         )
+        self.angle_error_view_button = self._make_tool_button(
+            "Error View",
+            object_name="contextButton",
+            checkable=True,
+            tooltip="Show φ/2θ error profiles instead of the normal intensity map.",
+            minimum_width=108,
+        )
         tools_row.addWidget(self.pick_center_button)
         tools_row.addWidget(self.roi_button)
+        tools_row.addWidget(self.angle_error_view_button)
 
         top_bar.addWidget(file_group)
         top_bar.addWidget(view_group)
@@ -1380,6 +1473,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.radial_bins_spin = QtWidgets.QSpinBox()
         self.azimuth_bins_spin = QtWidgets.QSpinBox()
         self.phi_zero_direction_combo = QtWidgets.QComboBox()
+        self.angle_display_combo = QtWidgets.QComboBox()
 
         for spin in (self.center_col_spin, self.center_row_spin):
             spin.setDecimals(2)
@@ -1432,6 +1526,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         for direction in PHI_ZERO_DIRECTIONS:
             self.phi_zero_direction_combo.addItem(direction.title())
         self.phi_zero_direction_combo.setCurrentText(DEFAULT_PHI_ZERO_DIRECTION.title())
+
+        self.angle_display_combo.setMinimumWidth(164)
+        self.angle_display_combo.setToolTip(
+            "Choose which φ/2θ error map to show while Error View is enabled."
+        )
+        for mode, label in _ANGLE_SPACE_ERROR_DISPLAY_MODES:
+            self.angle_display_combo.addItem(label, mode)
 
         self.bottom_log_button = self._make_tool_button(
             "Bottom Profile Log Y",
@@ -1496,6 +1597,14 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         profiles_layout = QtWidgets.QVBoxLayout(profiles_widget)
         profiles_layout.setContentsMargins(0, 0, 0, 0)
         profiles_layout.setSpacing(8)
+        display_row = QtWidgets.QGridLayout()
+        display_row.setContentsMargins(0, 0, 0, 0)
+        display_row.setHorizontalSpacing(12)
+        display_row.setVerticalSpacing(0)
+        self.angle_display_label = self._make_field_label("Error Metric")
+        display_row.addWidget(self.angle_display_label, 0, 0)
+        display_row.addWidget(self.angle_display_combo, 0, 1)
+        profiles_layout.addLayout(display_row)
         profiles_layout.addWidget(self.image_log_button)
         profiles_layout.addWidget(self.bottom_log_button)
         profiles_layout.addWidget(self.left_log_button)
@@ -1587,6 +1696,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         )
         self.pick_center_button.toggled.connect(self._on_pick_center_toggled)
         self.roi_button.toggled.connect(self._on_roi_toggled)
+        self.angle_error_view_button.toggled.connect(self._on_angle_error_view_toggled)
         self.image_log_button.toggled.connect(self.set_image_log_mode)
         self.bottom_log_button.toggled.connect(self.set_bottom_log_mode)
         self.left_log_button.toggled.connect(self.set_left_log_mode)
@@ -1597,6 +1707,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.phi_zero_direction_combo.currentTextChanged.connect(
             self._on_phi_zero_direction_changed
         )
+        self.angle_display_combo.currentIndexChanged.connect(self._on_angle_display_mode_changed)
 
         self.mouse_proxy = pg.SignalProxy(
             self.image_plot.scene().sigMouseMoved,
@@ -1623,6 +1734,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.q_space_view_button.setEnabled(has_detector)
         self.pick_center_button.setEnabled(has_detector and self.current_view_mode == "detector")
         self.roi_button.setEnabled(has_display and self.current_view_mode == "angle_space")
+        self.angle_error_view_button.setEnabled(has_display and self.current_view_mode == "angle_space")
         self.image_log_button.setEnabled(has_display)
         self.bottom_log_button.setEnabled(has_display)
         self.left_log_button.setEnabled(has_display)
@@ -1833,8 +1945,30 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             zero_direction=self._current_phi_zero_direction(),
         )
         self.angle_space_cake = cake
+        if self.angle_error_view_button.isChecked() and self.angle_space_error_result is None:
+            if not self._converting:
+                self._start_conversion(target_view="angle_space_error")
+            return
+        display_values, value_label = self._angle_space_display_values()
+        display_result = (
+            self.angle_space_result
+            if self._current_angle_display_mode() == "intensity"
+            else self.angle_space_error_result
+        )
+        display_cake, radial_deg, phi_deg = prepare_gui_phi_display_data(
+            display_result,
+            display_values,
+            phi_min_deg=DEFAULT_GUI_PHI_MIN_DEG,
+            phi_max_deg=DEFAULT_GUI_PHI_MAX_DEG,
+            zero_direction=self._current_phi_zero_direction(),
+        )
         if force_show or self.current_view_mode == "angle_space":
-            self.show_angle_space_view(cake, radial_deg, phi_deg)
+            self.show_angle_space_view(
+                display_cake,
+                radial_deg,
+                phi_deg,
+                value_label=value_label,
+            )
 
     def _update_q_space_display(self, *, force_show=False):
         if self.angle_space_result is None:
@@ -1868,6 +2002,20 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if self.current_view_mode == "q_space":
             self._update_q_space_display(force_show=True)
 
+    def _on_angle_display_mode_changed(self, _index):
+        self._sync_view_controls()
+        if (
+            self.current_view_mode == "angle_space"
+            and self.angle_space_result is not None
+            and self.angle_error_view_button.isChecked()
+        ):
+            self._update_angle_space_display(force_show=True)
+
+    def _on_angle_error_view_toggled(self, _enabled):
+        self._sync_view_controls()
+        if self.current_view_mode == "angle_space" and self.angle_space_result is not None:
+            self._update_angle_space_display(force_show=True)
+
     def _on_wavelength_changed(self, _value):
         self.q_space_result = None
         if self.current_view_mode == "q_space" and self.angle_space_result is not None:
@@ -1881,7 +2029,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def _set_image_aspect_locked(self, locked):
         self.image_view.setAspectLocked(bool(locked))
 
-    def _start_conversion(self, *, target_view="angle_space"):
+    def _start_conversion(
+        self,
+        *,
+        target_view="angle_space",
+    ):
         if self._converting or self.detector_data is None:
             return
         self._conversion_target_view = str(target_view)
@@ -1890,6 +2042,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 (self.detector_data.shape[0] - 1) / 2.0,
                 (self.detector_data.shape[1] - 1) / 2.0,
             )
+        compute_error_metrics = self._conversion_target_view == "angle_space_error"
         if "_AngleSpaceWorker" not in globals():
             try:
                 result = convert_image_to_phi_2theta_space(
@@ -1900,6 +2053,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                     center_col_px=self.beam_center_col,
                     radial_bins=self.radial_bins_spin.value(),
                     azimuth_bins=self.azimuth_bins_spin.value(),
+                    compute_coordinate_statistics=compute_error_metrics,
+                    compute_intensity_sem=compute_error_metrics,
                 )
             except Exception as exc:  # pragma: no cover - fallback error path
                 self._on_conversion_failed(str(exc))
@@ -1915,6 +2070,10 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self._set_status_message(
                 f"Converting to q-space via φ/2θ with {DEFAULT_ANGLE_SPACE_WORKERS} workers ..."
             )
+        elif self._conversion_target_view == "angle_space_error":
+            self._set_status_message(
+                f"Computing φ/2θ error metrics with {DEFAULT_ANGLE_SPACE_WORKERS} workers ..."
+            )
         else:
             self._set_status_message(
                 f"Converting to φ/2θ with {DEFAULT_ANGLE_SPACE_WORKERS} workers ..."
@@ -1929,6 +2088,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             center_col_px=self.beam_center_col,
             radial_bins=self.radial_bins_spin.value(),
             azimuth_bins=self.azimuth_bins_spin.value(),
+            compute_error_metrics=compute_error_metrics,
         )
         self._conversion_worker.moveToThread(self._conversion_thread)
 
@@ -1942,7 +2102,14 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._conversion_thread.start()
 
     def _on_conversion_loaded(self, payload):
+        if self._conversion_target_view == "angle_space_error":
+            self.angle_space_error_result = payload["result"]
+            if self.current_view_mode == "angle_space" and self.angle_error_view_button.isChecked():
+                self._update_angle_space_display(force_show=True)
+            return
+
         self.angle_space_result = payload["result"]
+        self.angle_space_error_result = None
         self.q_space_result = None
         if self._conversion_target_view == "q_space":
             self._update_q_space_display(force_show=True)
@@ -1950,12 +2117,23 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self._update_angle_space_display(force_show=True)
 
     def _on_conversion_failed(self, message):
-        target_label = "q-space via φ/2θ" if self._conversion_target_view == "q_space" else "φ/2θ space"
+        if self._conversion_target_view == "q_space":
+            target_label = "q-space via φ/2θ"
+        elif self._conversion_target_view == "angle_space_error":
+            target_label = "φ/2θ error metrics"
+        else:
+            target_label = "φ/2θ space"
         QtWidgets.QMessageBox.critical(
             self,
             "Conversion Error",
             f"Failed to convert the active image to {target_label}.\n\n{message}",
         )
+        if self._conversion_target_view == "angle_space_error" and self.angle_error_view_button.isChecked():
+            self.angle_error_view_button.blockSignals(True)
+            self.angle_error_view_button.setChecked(False)
+            self.angle_error_view_button.blockSignals(False)
+            if self.current_view_mode == "angle_space" and self.angle_space_result is not None:
+                self._update_angle_space_display(force_show=True)
         if self.data is not None:
             self._set_status_message(
                 "Conversion failed. Adjust the geometry and try again."
@@ -2053,6 +2231,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._clear_roi_items()
         self.detector_data = detector_data
         self.angle_space_result = None
+        self.angle_space_error_result = None
         self.angle_space_cake = None
         self.q_space_result = None
 
@@ -2082,6 +2261,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.display_x_label = x_label
         self.display_y_label = y_label
         self.data_min, self.data_max = self._estimate_data_stats()
+        self.bottom_plot.setLabel("left", self.display_value_label)
+        self.left_plot.setLabel("bottom", self.display_value_label)
 
         self.prepare_profile_cache()
 
@@ -2126,6 +2307,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if self.detector_data is None:
             return
         self.current_view_mode = "detector"
+        self.display_value_label = "Intensity"
         self.pick_center_button.blockSignals(True)
         self.pick_center_button.setChecked(False)
         self.pick_center_button.blockSignals(False)
@@ -2140,12 +2322,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             "Y pixels",
         )
 
-    def show_angle_space_view(self, cake, radial_deg, phi_deg):
+    def show_angle_space_view(self, cake, radial_deg, phi_deg, *, value_label="Intensity"):
         self.current_view_mode = "angle_space"
         self.pick_center_button.blockSignals(True)
         self.pick_center_button.setChecked(False)
         self.pick_center_button.blockSignals(False)
         self._set_image_aspect_locked(False)
+        self.display_value_label = str(value_label)
         self._set_display_data(
             cake,
             radial_deg,
@@ -2168,6 +2351,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.pick_center_button.blockSignals(True)
         self.pick_center_button.setChecked(False)
         self.pick_center_button.blockSignals(False)
+        self.display_value_label = "Intensity"
         self._set_image_aspect_locked(False)
         self._set_display_data(
             q_image,
@@ -2282,7 +2466,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if not force and ix == self.last_ix and iy == self.last_iy:
             return
 
-        intensity = float(self.data[iy, ix])
+        metric_value = float(self.data[iy, ix])
         x_value = float(self.display_x_full[ix])
         y_value = float(self.display_y_full[iy])
 
@@ -2294,17 +2478,17 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
         if self.bottom_log_enabled:
             row_plot = np.maximum(np.asarray(row_profile, dtype=np.float64), self.LOG_EPS)
-            bottom_marker_y = max(intensity, self.LOG_EPS)
+            bottom_marker_y = max(metric_value, self.LOG_EPS) if np.isfinite(metric_value) else self.LOG_EPS
         else:
             row_plot = row_profile
-            bottom_marker_y = intensity
+            bottom_marker_y = metric_value
 
         if self.left_log_enabled:
             col_plot = np.maximum(np.asarray(col_profile, dtype=np.float64), self.LOG_EPS)
-            left_marker_x = max(intensity, self.LOG_EPS)
+            left_marker_x = max(metric_value, self.LOG_EPS) if np.isfinite(metric_value) else self.LOG_EPS
         else:
             col_plot = col_profile
-            left_marker_x = intensity
+            left_marker_x = metric_value
 
         self.bottom_curve.setData(self.x_profile_coords, row_plot)
         self.left_curve.setData(col_plot, self.y_profile_coords)
@@ -2343,7 +2527,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             "Left-click+drag: zoom | Move mouse: inspect | "
             f"{self.display_x_label}: {self._x_text(ix)}  "
             f"{self.display_y_label}: {self._y_text(iy)}  "
-            f"Intensity: {intensity:.0f}  "
+            f"{self.display_value_label}: {self._format_display_value(metric_value)}  "
             f"{self._beam_center_summary()}"
             + (f"  {roi_summary}" if roi_summary else "")
         )
