@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import math
 import os
 import threading
@@ -156,6 +158,15 @@ class QSpaceResult:
     intensity: np.ndarray
 
 
+# Coordinate statistics depend on geometry/binning, not detector intensities.
+_COORDINATE_STATISTICS_CACHE_MAXSIZE = 4
+_COORDINATE_STATISTICS_CACHE_LOCK = threading.Lock()
+_COORDINATE_STATISTICS_CACHE: OrderedDict[
+    tuple[object, ...],
+    DetectorCakeCoordinateStats,
+] = OrderedDict()
+
+
 def _default_worker_count() -> int:
     return max(
         1,
@@ -178,6 +189,100 @@ def _validate_axes(radial_deg: np.ndarray, azimuthal_deg: np.ndarray) -> None:
         raise ValueError("radial_deg must be uniformly spaced.")
     if not np.allclose(azimuthal_step, azimuthal_step[0], rtol=1.0e-7, atol=1.0e-12):
         raise ValueError("azimuthal_deg must be uniformly spaced.")
+
+
+def _hash_array_contents(array: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(contiguous.dtype.str.encode("ascii"))
+    digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+    digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def _mask_cache_key(mask: np.ndarray | None, shape: tuple[int, int]) -> str | None:
+    if mask is None:
+        return None
+    mask_array = np.asarray(mask)
+    if mask_array.shape != shape:
+        raise ValueError("mask must match image shape.")
+    return _hash_array_contents(np.asarray(mask_array != 0, dtype=np.uint8))
+
+
+def _selection_cache_key(
+    shape: tuple[int, int],
+    rows: np.ndarray | None,
+    cols: np.ndarray | None,
+) -> tuple[str, str] | None:
+    rows_array, cols_array, use_selection = _prepare_selection(shape, rows, cols)
+    if not use_selection:
+        return None
+    order = np.lexsort((cols_array, rows_array))
+    return (
+        _hash_array_contents(rows_array[order].astype(np.int64, copy=False)),
+        _hash_array_contents(cols_array[order].astype(np.int64, copy=False)),
+    )
+
+
+def _geometry_uncertainty_cache_key(
+    geometry_uncertainty: DetectorCakeGeometryUncertainty | None,
+) -> str | None:
+    if geometry_uncertainty is None:
+        return None
+    return _hash_array_contents(np.asarray(geometry_uncertainty.covariance, dtype=np.float64))
+
+
+def _coordinate_statistics_cache_key(
+    image_or_shape: np.ndarray | tuple[int, int] | list[int],
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+    *,
+    mask: np.ndarray | None = None,
+    rows: np.ndarray | None = None,
+    cols: np.ndarray | None = None,
+    geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
+    numerical_subpixel_grid: int | None = None,
+) -> tuple[object, ...]:
+    shape = _resolve_image_shape(image_or_shape)
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    azimuthal = np.asarray(azimuthal_deg, dtype=np.float64)
+    return (
+        shape,
+        _hash_array_contents(radial),
+        _hash_array_contents(azimuthal),
+        float(geometry.distance_m),
+        float(geometry.pixel_size_m),
+        float(geometry.center_row_px),
+        float(geometry.center_col_px),
+        _mask_cache_key(mask, shape),
+        _selection_cache_key(shape, rows, cols),
+        _geometry_uncertainty_cache_key(geometry_uncertainty),
+        1 if numerical_subpixel_grid is None else int(numerical_subpixel_grid),
+    )
+
+
+def _get_cached_coordinate_statistics(
+    cache_key: tuple[object, ...],
+) -> DetectorCakeCoordinateStats | None:
+    with _COORDINATE_STATISTICS_CACHE_LOCK:
+        cached = _COORDINATE_STATISTICS_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _COORDINATE_STATISTICS_CACHE.move_to_end(cache_key)
+        return cached
+
+
+def _store_cached_coordinate_statistics(
+    cache_key: tuple[object, ...],
+    stats: DetectorCakeCoordinateStats,
+) -> DetectorCakeCoordinateStats:
+    with _COORDINATE_STATISTICS_CACHE_LOCK:
+        _COORDINATE_STATISTICS_CACHE[cache_key] = stats
+        _COORDINATE_STATISTICS_CACHE.move_to_end(cache_key)
+        while len(_COORDINATE_STATISTICS_CACHE) > _COORDINATE_STATISTICS_CACHE_MAXSIZE:
+            _COORDINATE_STATISTICS_CACHE.popitem(last=False)
+    return stats
 
 
 def _wrap_signed_degrees(values: np.ndarray) -> np.ndarray:
@@ -1182,6 +1287,76 @@ def _compute_intensity_sem(
     return sem
 
 
+def _compute_detector_to_cake_coordinate_statistics_uncached(
+    image_or_shape: np.ndarray | tuple[int, int] | list[int],
+    radial_deg: np.ndarray,
+    azimuthal_deg: np.ndarray,
+    geometry: DetectorCakeGeometry,
+    *,
+    mask: np.ndarray | None = None,
+    rows: np.ndarray | None = None,
+    cols: np.ndarray | None = None,
+    geometry_uncertainty: DetectorCakeGeometryUncertainty | None = None,
+    numerical_subpixel_grid: int | None = None,
+) -> DetectorCakeCoordinateStats:
+    base_moments = _compute_coordinate_moment_arrays(
+        image_or_shape,
+        radial_deg,
+        azimuthal_deg,
+        geometry,
+        mask=mask,
+        rows=rows,
+        cols=cols,
+        subdivide_pixels=1,
+    )
+    base_polygon_stats = _finalize_coordinate_statistics(radial_deg, azimuthal_deg, *base_moments)
+    base_stats = _apply_analytic_coordinate_uncertainty(
+        base_polygon_stats,
+        radial_deg,
+        azimuthal_deg,
+        geometry,
+    )
+
+    calibration_stats = None
+    if geometry_uncertainty is not None:
+        calibration_stats = _compute_calibration_coordinate_statistics(
+            radial_deg,
+            azimuthal_deg,
+            geometry,
+            base_stats,
+            geometry_uncertainty,
+        )
+
+    subpixel_error = None
+    refinement_grid = 1 if numerical_subpixel_grid is None else int(numerical_subpixel_grid)
+    if refinement_grid > 1:
+        refined_moments = _compute_coordinate_moment_arrays(
+            image_or_shape,
+            radial_deg,
+            azimuthal_deg,
+            geometry,
+            mask=mask,
+            rows=rows,
+            cols=cols,
+            subdivide_pixels=refinement_grid,
+        )
+        refined_stats = _finalize_coordinate_statistics(radial_deg, azimuthal_deg, *refined_moments)
+        subpixel_error = _compute_subpixel_refinement_error(
+            base_polygon_stats,
+            refined_stats,
+            refinement_grid=refinement_grid,
+        )
+
+    return _apply_analytic_coordinate_uncertainty(
+        base_polygon_stats,
+        radial_deg,
+        azimuthal_deg,
+        geometry,
+        calibration=calibration_stats,
+        subpixel_error=subpixel_error,
+    )
+
+
 def compute_detector_to_cake_coordinate_statistics(
     image_or_shape: np.ndarray | tuple[int, int] | list[int],
     radial_deg: np.ndarray,
@@ -1196,7 +1371,7 @@ def compute_detector_to_cake_coordinate_statistics(
 ) -> DetectorCakeCoordinateStats:
     radial = np.asarray(radial_deg, dtype=np.float64)
     azimuthal = np.asarray(azimuthal_deg, dtype=np.float64)
-    base_moments = _compute_coordinate_moment_arrays(
+    cache_key = _coordinate_statistics_cache_key(
         image_or_shape,
         radial,
         azimuthal,
@@ -1204,54 +1379,24 @@ def compute_detector_to_cake_coordinate_statistics(
         mask=mask,
         rows=rows,
         cols=cols,
-        subdivide_pixels=1,
+        geometry_uncertainty=geometry_uncertainty,
+        numerical_subpixel_grid=numerical_subpixel_grid,
     )
-    base_polygon_stats = _finalize_coordinate_statistics(radial, azimuthal, *base_moments)
-    base_stats = _apply_analytic_coordinate_uncertainty(
-        base_polygon_stats,
+    cached = _get_cached_coordinate_statistics(cache_key)
+    if cached is not None:
+        return cached
+    stats = _compute_detector_to_cake_coordinate_statistics_uncached(
+        image_or_shape,
         radial,
         azimuthal,
         geometry,
+        mask=mask,
+        rows=rows,
+        cols=cols,
+        geometry_uncertainty=geometry_uncertainty,
+        numerical_subpixel_grid=numerical_subpixel_grid,
     )
-
-    calibration_stats = None
-    if geometry_uncertainty is not None:
-        calibration_stats = _compute_calibration_coordinate_statistics(
-            radial,
-            azimuthal,
-            geometry,
-            base_stats,
-            geometry_uncertainty,
-        )
-
-    subpixel_error = None
-    refinement_grid = 1 if numerical_subpixel_grid is None else int(numerical_subpixel_grid)
-    if refinement_grid > 1:
-        refined_moments = _compute_coordinate_moment_arrays(
-            image_or_shape,
-            radial,
-            azimuthal,
-            geometry,
-            mask=mask,
-            rows=rows,
-            cols=cols,
-            subdivide_pixels=refinement_grid,
-        )
-        refined_stats = _finalize_coordinate_statistics(radial, azimuthal, *refined_moments)
-        subpixel_error = _compute_subpixel_refinement_error(
-            base_polygon_stats,
-            refined_stats,
-            refinement_grid=refinement_grid,
-        )
-
-    return _apply_analytic_coordinate_uncertainty(
-        base_polygon_stats,
-        radial,
-        azimuthal,
-        geometry,
-        calibration=calibration_stats,
-        subpixel_error=subpixel_error,
-    )
+    return _store_cached_coordinate_statistics(cache_key, stats)
 
 
 def _accumulate_pixel_python(
