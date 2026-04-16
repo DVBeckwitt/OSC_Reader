@@ -158,6 +158,27 @@ class QSpaceResult:
     intensity: np.ndarray
 
 
+@dataclass(frozen=True)
+class _QSpaceCoordinateMap:
+    qr: np.ndarray
+    qz: np.ndarray
+    flat_bin_index: np.ndarray
+    coordinate_valid_indices: np.ndarray
+    sample_count: np.ndarray
+    qr_bins: int
+    qz_bins: int
+
+
+# Reciprocal-space coordinates depend on angle-space grid and q parameters,
+# not intensity values being rebinned.
+_QSPACE_COORDINATE_CACHE_MAXSIZE = 4
+_QSPACE_COORDINATE_CACHE_LOCK = threading.Lock()
+_QSPACE_COORDINATE_CACHE: OrderedDict[
+    tuple[object, ...],
+    _QSpaceCoordinateMap,
+] = OrderedDict()
+
+
 # Coordinate statistics depend on geometry/binning, not detector intensities.
 _COORDINATE_STATISTICS_CACHE_MAXSIZE = 4
 _COORDINATE_STATISTICS_CACHE_LOCK = threading.Lock()
@@ -198,6 +219,52 @@ def _hash_array_contents(array: np.ndarray) -> str:
     digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
     digest.update(contiguous.tobytes())
     return digest.hexdigest()
+
+
+def _q_space_coordinate_cache_key(
+    radial_deg: np.ndarray,
+    phi_deg: np.ndarray,
+    *,
+    wavelength_angstrom: float,
+    incident_angle_deg: float,
+    qr_bins: int,
+    qz_bins: int,
+) -> tuple[object, ...]:
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    phi = np.asarray(phi_deg, dtype=np.float64)
+    return (
+        _hash_array_contents(radial),
+        _hash_array_contents(phi),
+        float(wavelength_angstrom),
+        float(incident_angle_deg),
+        int(qr_bins),
+        int(qz_bins),
+    )
+
+
+# Cached coordinate map stores expensive trig + bin lookup so repeated q-space
+# rebins only need weighted accumulation over intensity.
+def _get_cached_q_space_coordinate_map(
+    cache_key: tuple[object, ...],
+) -> _QSpaceCoordinateMap | None:
+    with _QSPACE_COORDINATE_CACHE_LOCK:
+        cached = _QSPACE_COORDINATE_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _QSPACE_COORDINATE_CACHE.move_to_end(cache_key)
+        return cached
+
+
+def _store_cached_q_space_coordinate_map(
+    cache_key: tuple[object, ...],
+    mapping: _QSpaceCoordinateMap,
+) -> _QSpaceCoordinateMap:
+    with _QSPACE_COORDINATE_CACHE_LOCK:
+        _QSPACE_COORDINATE_CACHE[cache_key] = mapping
+        _QSPACE_COORDINATE_CACHE.move_to_end(cache_key)
+        while len(_QSPACE_COORDINATE_CACHE) > _QSPACE_COORDINATE_CACHE_MAXSIZE:
+            _QSPACE_COORDINATE_CACHE.popitem(last=False)
+    return mapping
 
 
 def _mask_cache_key(mask: np.ndarray | None, shape: tuple[int, int]) -> str | None:
@@ -2383,6 +2450,203 @@ def prepare_gui_phi_display(
     )
 
 
+def _compute_q_space_coordinate_map_uncached(
+    radial_deg: np.ndarray,
+    phi_deg: np.ndarray,
+    *,
+    wavelength_angstrom: float,
+    incident_angle_deg: float,
+    qr_bins: int,
+    qz_bins: int,
+) -> _QSpaceCoordinateMap:
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    phi = np.asarray(phi_deg, dtype=np.float64)
+
+    phi_rad = np.deg2rad(phi)[:, None]
+    theta_rad = np.deg2rad(radial)[None, :]
+    sin_phi = np.sin(phi_rad)
+    cos_phi = np.cos(phi_rad)
+    sin_theta = np.sin(theta_rad)
+    cos_theta = np.cos(theta_rad)
+
+    wavevector = (2.0 * np.pi) / float(wavelength_angstrom)
+    incident_rad = np.deg2rad(float(incident_angle_deg))
+    sin_incident = np.sin(incident_rad)
+    cos_incident = np.cos(incident_rad)
+
+    delta_cos = cos_theta - 1.0
+    sin_theta_cos_phi = sin_theta * cos_phi
+    qy = (cos_incident * delta_cos + sin_incident * sin_theta_cos_phi) * wavevector
+    qz = (-sin_incident * delta_cos + cos_incident * sin_theta_cos_phi) * wavevector
+    qr_mag = np.hypot((sin_theta * sin_phi) * wavevector, qy)
+    qr_flat = np.where(phi_rad >= 0.0, qr_mag, -qr_mag).reshape(-1)
+    qz_flat = qz.reshape(-1)
+
+    coordinate_valid = np.isfinite(qr_flat) & np.isfinite(qz_flat)
+    if not np.any(coordinate_valid):
+        raise ValueError(
+            "No finite q-space samples were produced from the current angle-space image."
+        )
+
+    qr_valid = qr_flat[coordinate_valid]
+    qz_valid = qz_flat[coordinate_valid]
+
+    qr_min = float(np.min(qr_valid))
+    qr_max = float(np.max(qr_valid))
+    qz_min = float(np.min(qz_valid))
+    qz_max = float(np.max(qz_valid))
+    if np.isclose(qr_min, qr_max):
+        qr_pad = max(abs(qr_min) * 0.01, 1.0e-3)
+        qr_min -= qr_pad
+        qr_max += qr_pad
+    if np.isclose(qz_min, qz_max):
+        qz_pad = max(abs(qz_min) * 0.01, 1.0e-3)
+        qz_min -= qz_pad
+        qz_max += qz_pad
+
+    qr_scale = float(qr_bins) / (qr_max - qr_min)
+    qz_scale = float(qz_bins) / (qz_max - qz_min)
+    qr_index = np.floor((qr_valid - qr_min) * qr_scale).astype(np.int32, copy=False)
+    qz_index = np.floor((qz_valid - qz_min) * qz_scale).astype(np.int32, copy=False)
+    np.clip(qr_index, 0, int(qr_bins) - 1, out=qr_index)
+    np.clip(qz_index, 0, int(qz_bins) - 1, out=qz_index)
+    flat_bin_index = (
+        qz_index.astype(np.int64) * int(qr_bins) + qr_index.astype(np.int64)
+    ).astype(np.int32, copy=False)
+    sample_count = np.bincount(
+        flat_bin_index,
+        minlength=int(qr_bins) * int(qz_bins),
+    ).astype(np.int32, copy=False)
+
+    qr_edges = np.linspace(qr_min, qr_max, int(qr_bins) + 1, dtype=np.float64)
+    qz_edges = np.linspace(qz_min, qz_max, int(qz_bins) + 1, dtype=np.float64)
+    return _QSpaceCoordinateMap(
+        qr=0.5 * (qr_edges[:-1] + qr_edges[1:]),
+        qz=0.5 * (qz_edges[:-1] + qz_edges[1:]),
+        flat_bin_index=flat_bin_index,
+        coordinate_valid_indices=np.flatnonzero(coordinate_valid).astype(np.int32, copy=False),
+        sample_count=sample_count,
+        qr_bins=int(qr_bins),
+        qz_bins=int(qz_bins),
+    )
+
+
+def _get_q_space_coordinate_map(
+    radial_deg: np.ndarray,
+    phi_deg: np.ndarray,
+    *,
+    wavelength_angstrom: float,
+    incident_angle_deg: float,
+    qr_bins: int,
+    qz_bins: int,
+) -> _QSpaceCoordinateMap:
+    cache_key = _q_space_coordinate_cache_key(
+        radial_deg,
+        phi_deg,
+        wavelength_angstrom=float(wavelength_angstrom),
+        incident_angle_deg=float(incident_angle_deg),
+        qr_bins=int(qr_bins),
+        qz_bins=int(qz_bins),
+    )
+    cached = _get_cached_q_space_coordinate_map(cache_key)
+    if cached is not None:
+        return cached
+    mapping = _compute_q_space_coordinate_map_uncached(
+        radial_deg,
+        phi_deg,
+        wavelength_angstrom=float(wavelength_angstrom),
+        incident_angle_deg=float(incident_angle_deg),
+        qr_bins=int(qr_bins),
+        qz_bins=int(qz_bins),
+    )
+    return _store_cached_q_space_coordinate_map(cache_key, mapping)
+
+
+def _convert_phi_2theta_to_qr_qz_space_fallback(
+    intensity: np.ndarray,
+    radial_deg: np.ndarray,
+    phi_deg: np.ndarray,
+    *,
+    wavelength_angstrom: float,
+    incident_angle_deg: float,
+    qr_bins: int,
+    qz_bins: int,
+) -> QSpaceResult:
+    cake = np.asarray(intensity, dtype=np.float64)
+    radial = np.asarray(radial_deg, dtype=np.float64)
+    phi = np.asarray(phi_deg, dtype=np.float64)
+
+    phi_rad = np.deg2rad(phi)[:, None]
+    theta_rad = np.deg2rad(radial)[None, :]
+
+    sin_phi = np.sin(phi_rad)
+    cos_phi = np.cos(phi_rad)
+    sin_theta = np.sin(theta_rad)
+    cos_theta = np.cos(theta_rad)
+
+    wavevector = (2.0 * np.pi) / float(wavelength_angstrom)
+    incident_rad = np.deg2rad(float(incident_angle_deg))
+    sin_incident = np.sin(incident_rad)
+    cos_incident = np.cos(incident_rad)
+
+    delta_cos = cos_theta - 1.0
+    sin_theta_cos_phi = sin_theta * cos_phi
+    qy = (cos_incident * delta_cos + sin_incident * sin_theta_cos_phi) * wavevector
+    qz = (-sin_incident * delta_cos + cos_incident * sin_theta_cos_phi) * wavevector
+    qr_mag = np.hypot((sin_theta * sin_phi) * wavevector, qy)
+    qr = np.where(phi_rad >= 0.0, qr_mag, -qr_mag)
+
+    qr_flat = qr.reshape(-1)
+    qz_flat = qz.reshape(-1)
+    intensity_flat = cake.reshape(-1)
+    valid = np.isfinite(qr_flat) & np.isfinite(qz_flat) & np.isfinite(intensity_flat)
+    if not np.any(valid):
+        raise ValueError(
+            "No finite q-space samples were produced from the current angle-space image."
+        )
+
+    qr_flat = qr_flat[valid]
+    qz_flat = qz_flat[valid]
+    intensity_flat = intensity_flat[valid]
+
+    qr_min = float(np.min(qr_flat))
+    qr_max = float(np.max(qr_flat))
+    qz_min = float(np.min(qz_flat))
+    qz_max = float(np.max(qz_flat))
+    if np.isclose(qr_min, qr_max):
+        qr_pad = max(abs(qr_min) * 0.01, 1.0e-3)
+        qr_min -= qr_pad
+        qr_max += qr_pad
+    if np.isclose(qz_min, qz_max):
+        qz_pad = max(abs(qz_min) * 0.01, 1.0e-3)
+        qz_min -= qz_pad
+        qz_max += qz_pad
+
+    qr_edges = np.linspace(qr_min, qr_max, int(qr_bins) + 1, dtype=np.float64)
+    qz_edges = np.linspace(qz_min, qz_max, int(qz_bins) + 1, dtype=np.float64)
+    weighted_sum, _, _ = np.histogram2d(
+        qz_flat,
+        qr_flat,
+        bins=(qz_edges, qr_edges),
+        weights=intensity_flat,
+    )
+    sample_count, _, _ = np.histogram2d(
+        qz_flat,
+        qr_flat,
+        bins=(qz_edges, qr_edges),
+    )
+    rebinned = np.divide(
+        weighted_sum,
+        sample_count,
+        out=np.zeros_like(weighted_sum, dtype=np.float64),
+        where=sample_count > 0.0,
+    )
+
+    qr_centers = 0.5 * (qr_edges[:-1] + qr_edges[1:])
+    qz_centers = 0.5 * (qz_edges[:-1] + qz_edges[1:])
+    return QSpaceResult(qr=qr_centers, qz=qz_centers, intensity=rebinned)
+
+
 def convert_phi_2theta_to_qr_qz_space(
     intensity: np.ndarray,
     radial_deg: np.ndarray,
@@ -2413,77 +2677,52 @@ def convert_phi_2theta_to_qr_qz_space(
     if wavelength <= 0.0:
         raise ValueError("wavelength_angstrom must be positive.")
 
-    phi_rad = np.deg2rad(phi)[:, None]
-    theta_rad = np.deg2rad(radial)[None, :]
+    coordinate_map = _get_q_space_coordinate_map(
+        radial,
+        phi,
+        wavelength_angstrom=wavelength,
+        incident_angle_deg=float(incident_angle_deg),
+        qr_bins=qr_bins,
+        qz_bins=qz_bins,
+    )
 
-    sin_phi = np.sin(phi_rad)
-    cos_phi = np.cos(phi_rad)
-    sin_theta = np.sin(theta_rad)
-    cos_theta = np.cos(theta_rad)
-
-    wavevector = (2.0 * np.pi) / wavelength
-    incident_rad = np.deg2rad(float(incident_angle_deg))
-    sin_incident = np.sin(incident_rad)
-    cos_incident = np.cos(incident_rad)
-
-    delta_cos = cos_theta - 1.0
-    sin_theta_cos_phi = sin_theta * cos_phi
-    qy = (cos_incident * delta_cos + sin_incident * sin_theta_cos_phi) * wavevector
-    qz = (-sin_incident * delta_cos + cos_incident * sin_theta_cos_phi) * wavevector
-    qr_mag = np.hypot((sin_theta * sin_phi) * wavevector, qy)
-    qr = np.where(phi_rad >= 0.0, qr_mag, -qr_mag)
-
-    qr_flat = qr.reshape(-1)
-    qz_flat = qz.reshape(-1)
     intensity_flat = cake.reshape(-1)
-    valid = (
-        np.isfinite(qr_flat)
-        & np.isfinite(qz_flat)
-        & np.isfinite(intensity_flat)
-    )
-    if not np.any(valid):
-        raise ValueError("No finite q-space samples were produced from the current angle-space image.")
+    intensity_valid = intensity_flat[coordinate_map.coordinate_valid_indices]
+    finite_intensity = np.isfinite(intensity_valid)
+    if not np.any(finite_intensity):
+        raise ValueError(
+            "No finite q-space samples were produced from the current angle-space image."
+        )
+    if not np.all(finite_intensity):
+        return _convert_phi_2theta_to_qr_qz_space_fallback(
+            cake,
+            radial,
+            phi,
+            wavelength_angstrom=wavelength,
+            incident_angle_deg=float(incident_angle_deg),
+            qr_bins=qr_bins,
+            qz_bins=qz_bins,
+        )
 
-    qr_flat = qr_flat[valid]
-    qz_flat = qz_flat[valid]
-    intensity_flat = intensity_flat[valid]
-
-    qr_min = float(np.min(qr_flat))
-    qr_max = float(np.max(qr_flat))
-    qz_min = float(np.min(qz_flat))
-    qz_max = float(np.max(qz_flat))
-    if np.isclose(qr_min, qr_max):
-        qr_pad = max(abs(qr_min) * 0.01, 1.0e-3)
-        qr_min -= qr_pad
-        qr_max += qr_pad
-    if np.isclose(qz_min, qz_max):
-        qz_pad = max(abs(qz_min) * 0.01, 1.0e-3)
-        qz_min -= qz_pad
-        qz_max += qz_pad
-
-    qr_edges = np.linspace(qr_min, qr_max, qr_bins + 1, dtype=np.float64)
-    qz_edges = np.linspace(qz_min, qz_max, qz_bins + 1, dtype=np.float64)
-    weighted_sum, _, _ = np.histogram2d(
-        qz_flat,
-        qr_flat,
-        bins=(qz_edges, qr_edges),
-        weights=intensity_flat,
+    output_size = int(coordinate_map.qr_bins) * int(coordinate_map.qz_bins)
+    weighted_sum = np.bincount(
+        coordinate_map.flat_bin_index,
+        weights=intensity_valid,
+        minlength=output_size,
     )
-    sample_count, _, _ = np.histogram2d(
-        qz_flat,
-        qr_flat,
-        bins=(qz_edges, qr_edges),
-    )
+    sample_count = coordinate_map.sample_count
     rebinned = np.divide(
         weighted_sum,
         sample_count,
-        out=np.zeros_like(weighted_sum, dtype=np.float64),
-        where=sample_count > 0.0,
-    )
+        out=np.zeros(output_size, dtype=np.float64),
+        where=sample_count > 0,
+    ).reshape(int(coordinate_map.qz_bins), int(coordinate_map.qr_bins))
 
-    qr_centers = 0.5 * (qr_edges[:-1] + qr_edges[1:])
-    qz_centers = 0.5 * (qz_edges[:-1] + qz_edges[1:])
-    return QSpaceResult(qr=qr_centers, qz=qz_centers, intensity=rebinned)
+    return QSpaceResult(
+        qr=np.array(coordinate_map.qr, copy=True),
+        qz=np.array(coordinate_map.qz, copy=True),
+        intensity=rebinned,
+    )
 
 
 __all__ = [
