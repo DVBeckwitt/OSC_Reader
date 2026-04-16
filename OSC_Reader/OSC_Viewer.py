@@ -896,6 +896,26 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             center_col_px=self.beam_center_col,
         )
 
+    def _clear_converted_view_results(self):
+        self.angle_space_result = None
+        self.angle_space_error_result = None
+        self.angle_space_cake = None
+        self.q_space_result = None
+
+    def _invalidate_geometry_dependent_views(self, *, refresh_active_view=False):
+        self._clear_converted_view_results()
+        if (
+            not refresh_active_view
+            or self.detector_data is None
+            or self._loading
+            or self._converting
+        ):
+            return
+        if self.current_view_mode == "q_space":
+            self.convert_active_image_to_q_space()
+        elif self.current_view_mode == "angle_space":
+            self.convert_active_image()
+
     def _ensure_angle_space_coordinate_stats(self):
         if self.angle_space_result is None:
             raise ValueError("Angle-space result is unavailable.")
@@ -2055,6 +2075,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             spin.setDecimals(2)
             spin.setRange(-1_000_000.0, 1_000_000.0)
             spin.setSingleStep(1.0)
+            spin.setKeyboardTracking(False)
             spin.setMinimumWidth(132)
 
         self.distance_spin.setDecimals(4)
@@ -2062,6 +2083,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.distance_spin.setSingleStep(0.1)
         self.distance_spin.setSuffix(" mm")
         self.distance_spin.setValue(75.0)
+        self.distance_spin.setKeyboardTracking(False)
         self.distance_spin.setMinimumWidth(132)
 
         self.pixel_size_spin.setDecimals(5)
@@ -2069,6 +2091,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.pixel_size_spin.setSingleStep(0.001)
         self.pixel_size_spin.setSuffix(" mm")
         self.pixel_size_spin.setValue(0.1)
+        self.pixel_size_spin.setKeyboardTracking(False)
         self.pixel_size_spin.setMinimumWidth(132)
 
         self.wavelength_spin.setDecimals(5)
@@ -2091,6 +2114,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         for spin in (self.radial_bins_spin, self.azimuth_bins_spin):
             spin.setRange(2, 10000)
             spin.setSingleStep(10)
+            spin.setKeyboardTracking(False)
             spin.setMinimumWidth(132)
         self.radial_bins_spin.setValue(_VIEWER_DEFAULT_RADIAL_BINS)
         self.azimuth_bins_spin.setValue(_VIEWER_DEFAULT_AZIMUTH_BINS)
@@ -2282,6 +2306,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self.left_log_button.toggled.connect(self.set_left_log_mode)
         self.center_col_spin.valueChanged.connect(self._on_beam_center_spin_changed)
         self.center_row_spin.valueChanged.connect(self._on_beam_center_spin_changed)
+        for widget in (
+            self.distance_spin,
+            self.pixel_size_spin,
+            self.radial_bins_spin,
+            self.azimuth_bins_spin,
+        ):
+            widget.valueChanged.connect(self._on_geometry_parameter_changed)
         self.wavelength_spin.valueChanged.connect(self._on_wavelength_changed)
         self.incident_angle_spin.valueChanged.connect(self._on_incident_angle_changed)
         self.phi_zero_direction_combo.currentTextChanged.connect(
@@ -2350,6 +2381,8 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if self.detector_data is not None:
             row = float(np.clip(row, 0.0, self.detector_data.shape[0] - 1))
             col = float(np.clip(col, 0.0, self.detector_data.shape[1] - 1))
+        previous_row = self.beam_center_row
+        previous_col = self.beam_center_col
         self.beam_center_row = float(row)
         self.beam_center_col = float(col)
         if update_spins:
@@ -2360,6 +2393,19 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.center_row_spin.blockSignals(False)
             self.center_col_spin.blockSignals(False)
         self._update_beam_center_marker()
+        beam_center_changed = (
+            previous_row is None
+            or previous_col is None
+            or previous_row != self.beam_center_row
+            or previous_col != self.beam_center_col
+        )
+        if beam_center_changed:
+            self._invalidate_geometry_dependent_views(
+                refresh_active_view=(
+                    not self._restoring_cache
+                    and self.current_view_mode in {"angle_space", "q_space"}
+                )
+            )
         self._schedule_cache_save()
 
     def _update_beam_center_marker(self):
@@ -2383,6 +2429,13 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             self.center_row_spin.value(),
             self.center_col_spin.value(),
             update_spins=False,
+        )
+
+    def _on_geometry_parameter_changed(self, _value):
+        if self._restoring_cache:
+            return
+        self._invalidate_geometry_dependent_views(
+            refresh_active_view=self.current_view_mode in {"angle_space", "q_space"}
         )
 
     def _on_pick_center_toggled(self, enabled):
@@ -2851,10 +2904,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         self._clear_roi_items()
         self._set_main_display_page("heatmap")
         self.detector_data = detector_data
-        self.angle_space_result = None
-        self.angle_space_error_result = None
-        self.angle_space_cake = None
-        self.q_space_result = None
+        self._clear_converted_view_results()
 
         detector_height, detector_width = self.detector_data.shape
         self.center_col_spin.setRange(-1_000_000.0, max(1_000_000.0, float(detector_width)))

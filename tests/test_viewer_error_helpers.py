@@ -303,6 +303,109 @@ class ViewerErrorHelperTests(unittest.TestCase):
             viewer.close()
             self._app.processEvents()
 
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_beam_center_change_invalidates_cached_converted_views(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.detector_data = np.zeros((8, 10), dtype=np.float32)
+            viewer.beam_center_row = 3.0
+            viewer.beam_center_col = 4.0
+            viewer.angle_space_result = self._base_result()
+            viewer.angle_space_error_result = replace(
+                self._base_result(),
+                intensity_sem=np.full((2, 2), 0.5, dtype=np.float64),
+            )
+            viewer.angle_space_cake = np.ones((2, 2), dtype=np.float32)
+            viewer.q_space_result = object()
+
+            viewer._set_beam_center(5.0, 6.0)
+
+            self.assertIsNone(viewer.angle_space_result)
+            self.assertIsNone(viewer.angle_space_error_result)
+            self.assertIsNone(viewer.angle_space_cake)
+            self.assertIsNone(viewer.q_space_result)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_beam_center_change_recomputes_active_angle_space_view(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.detector_data = np.zeros((8, 10), dtype=np.float32)
+            viewer.current_view_mode = "angle_space"
+            viewer.beam_center_row = 3.0
+            viewer.beam_center_col = 4.0
+            viewer.angle_space_result = self._base_result()
+            viewer.q_space_result = object()
+
+            with mock.patch.object(viewer, "convert_active_image") as convert_mock:
+                viewer._set_beam_center(5.0, 6.0)
+
+            convert_mock.assert_called_once_with()
+            self.assertIsNone(viewer.angle_space_result)
+            self.assertIsNone(viewer.q_space_result)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_small_beam_center_change_recomputes_active_angle_space_view(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.detector_data = np.zeros((2005, 2005), dtype=np.uint8)
+            viewer.current_view_mode = "angle_space"
+            viewer.beam_center_row = 1000.0
+            viewer.beam_center_col = 1000.0
+            viewer.angle_space_result = self._base_result()
+            viewer.q_space_result = object()
+
+            with mock.patch.object(viewer, "convert_active_image") as convert_mock:
+                viewer._set_beam_center(1000.01, 1000.0)
+
+            convert_mock.assert_called_once_with()
+            self.assertIsNone(viewer.angle_space_result)
+            self.assertIsNone(viewer.q_space_result)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_geometry_parameter_change_recomputes_active_q_space_view(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.detector_data = np.zeros((8, 10), dtype=np.float32)
+            viewer.current_view_mode = "q_space"
+            viewer.angle_space_result = self._base_result()
+            viewer.q_space_result = object()
+
+            with mock.patch.object(viewer, "convert_active_image_to_q_space") as convert_mock:
+                viewer._on_geometry_parameter_changed(viewer.distance_spin.value())
+
+            convert_mock.assert_called_once_with()
+            self.assertIsNone(viewer.angle_space_result)
+            self.assertIsNone(viewer.q_space_result)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_geometry_spin_boxes_disable_keyboard_tracking(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            for spin in (
+                viewer.center_col_spin,
+                viewer.center_row_spin,
+                viewer.distance_spin,
+                viewer.pixel_size_spin,
+                viewer.radial_bins_spin,
+                viewer.azimuth_bins_spin,
+            ):
+                self.assertFalse(spin.keyboardTracking())
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
