@@ -182,20 +182,12 @@ def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False
         return 0.0, 1.0
 
     if log_enabled:
-        positive = finite[finite > 0.0]
-        if positive.size == 0:
-            return float(log_eps), float(log_eps * 10.0)
-        if favor_low_intensity:
-            vmin = float(max(np.percentile(positive, 5.0), log_eps))
-            vmax = float(max(np.percentile(positive, 97.5), vmin * 1.01))
-        else:
-            slider_low = float(max(np.min(positive), log_eps))
-            slider_high = float(max(np.max(positive), slider_low * 1.01))
-            vmin = slider_low
-            vmax = float(slider_low + 0.85 * (slider_high - slider_low))
-            if vmax <= vmin:
-                vmax = slider_high
-        return vmin, vmax
+        display_min = float(np.min(finite))
+        display_max = float(np.max(finite))
+        if np.isclose(display_min, display_max):
+            display_min -= 1.0
+            display_max += 1.0
+        return display_min, display_max
 
     if favor_low_intensity:
         nonnegative = finite[finite >= 0.0]
@@ -1513,11 +1505,76 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
                 sample_max = float(np.max(finite_full))
         return sample_min, sample_max
 
+    def _display_edge_ranges(self):
+        return (
+            (float(self.display_x_edges[0]), float(self.display_x_edges[-1])),
+            (float(self.display_y_edges[0]), float(self.display_y_edges[-1])),
+        )
+
+    def _aspect_expanded_ranges(self, x_range, y_range):
+        x_low, x_high = x_range
+        y_low, y_high = y_range
+        x_span = max(float(x_high - x_low), np.finfo(float).eps)
+        y_span = max(float(y_high - y_low), np.finfo(float).eps)
+        limit_padding = 0.05 * max(x_span, y_span)
+        expanded_x_low, expanded_x_high = x_low, x_high
+        expanded_y_low, expanded_y_high = y_low, y_high
+
+        try:
+            view_width = float(self.image_view.width())
+            view_height = float(self.image_view.height())
+        except Exception:
+            view_width = 0.0
+            view_height = 0.0
+
+        if view_width <= 0.0 or view_height <= 0.0:
+            fallback_margin = 0.5 * max(x_span, y_span)
+            expanded_x_low = x_low - fallback_margin
+            expanded_x_high = x_high + fallback_margin
+            expanded_y_low = y_low - fallback_margin
+            expanded_y_high = y_high + fallback_margin
+        else:
+            view_ratio = view_width / view_height
+            data_ratio = x_span / y_span
+            if view_ratio > data_ratio:
+                expanded_x_span = y_span * view_ratio
+                margin = 0.5 * (expanded_x_span - x_span)
+                expanded_x_low = x_low - margin
+                expanded_x_high = x_high + margin
+            else:
+                expanded_y_span = x_span / view_ratio
+                margin = 0.5 * (expanded_y_span - y_span)
+                expanded_y_low = y_low - margin
+                expanded_y_high = y_high + margin
+
+        return (
+            (expanded_x_low - limit_padding, expanded_x_high + limit_padding),
+            (expanded_y_low - limit_padding, expanded_y_high + limit_padding),
+        )
+
+    def _apply_full_display_range(self):
+        x_range, y_range = self._display_edge_ranges()
+        self.image_view.setRange(
+            xRange=x_range,
+            yRange=y_range,
+            padding=0.0,
+        )
+
     def _image_display_data(self):
         image = np.asarray(self.data, dtype=np.float64)
         if not self.image_log_enabled:
             return image
-        return np.log10(np.maximum(image, self.LOG_EPS))
+        finite_positive = image[np.isfinite(image) & (image > 0.0)]
+        positive_replacement = (
+            float(np.max(finite_positive)) if finite_positive.size else self.LOG_EPS
+        )
+        safe_image = np.nan_to_num(
+            image,
+            nan=self.LOG_EPS,
+            posinf=positive_replacement,
+            neginf=self.LOG_EPS,
+        )
+        return np.log10(np.maximum(safe_image, self.LOG_EPS))
 
     def _refresh_image_display(self):
         if self.data is None:
@@ -2949,17 +3006,19 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             )
         )
 
+        limit_x_range, limit_y_range = self._display_edge_ranges()
+        if self.current_view_mode == "detector":
+            limit_x_range, limit_y_range = self._aspect_expanded_ranges(
+                limit_x_range,
+                limit_y_range,
+            )
         self.image_plot.setLimits(
-            xMin=float(self.display_x_edges[0]),
-            xMax=float(self.display_x_edges[-1]),
-            yMin=float(self.display_y_edges[0]),
-            yMax=float(self.display_y_edges[-1]),
+            xMin=limit_x_range[0],
+            xMax=limit_x_range[1],
+            yMin=limit_y_range[0],
+            yMax=limit_y_range[1],
         )
-        self.image_view.setRange(
-            xRange=(float(self.display_x_edges[0]), float(self.display_x_edges[-1])),
-            yRange=(float(self.display_y_edges[0]), float(self.display_y_edges[-1])),
-            padding=0.0,
-        )
+        self._apply_full_display_range()
 
         low, high = self._safe_limits_linear(self.data_min, self.data_max)
         self.bottom_plot.setYRange(low, high, padding=0.02)
@@ -3046,10 +3105,23 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
     def _positive_only(self, values):
         clipped = np.asarray(values, dtype=np.float64)
-        clipped = clipped[clipped > 0]
+        clipped = clipped[np.isfinite(clipped) & (clipped > 0)]
         if clipped.size == 0:
             return np.array([self.LOG_EPS], dtype=np.float64)
         return clipped
+
+    def _profile_plot_values(self, values, log_enabled):
+        values = np.asarray(values, dtype=np.float64)
+        if log_enabled:
+            return np.where(np.isfinite(values) & (values > 0.0), values, self.LOG_EPS)
+        return np.where(np.isfinite(values), values, np.nan)
+
+    def _profile_marker_value(self, value, log_enabled):
+        if not np.isfinite(value):
+            return self.LOG_EPS if log_enabled else None
+        if log_enabled:
+            return max(float(value), self.LOG_EPS)
+        return float(value)
 
     def _profile_visible_slice(self):
         x_low, x_high = sorted(self.image_view.viewRange()[0])
@@ -3155,24 +3227,21 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         row_profile = self.data[iy, ::self.step_x]
         col_profile = self.data[::self.step_y, ix]
 
-        if self.bottom_log_enabled:
-            row_plot = np.maximum(np.asarray(row_profile, dtype=np.float64), self.LOG_EPS)
-            bottom_marker_y = max(metric_value, self.LOG_EPS) if np.isfinite(metric_value) else self.LOG_EPS
-        else:
-            row_plot = row_profile
-            bottom_marker_y = metric_value
-
-        if self.left_log_enabled:
-            col_plot = np.maximum(np.asarray(col_profile, dtype=np.float64), self.LOG_EPS)
-            left_marker_x = max(metric_value, self.LOG_EPS) if np.isfinite(metric_value) else self.LOG_EPS
-        else:
-            col_plot = col_profile
-            left_marker_x = metric_value
+        row_plot = self._profile_plot_values(row_profile, self.bottom_log_enabled)
+        col_plot = self._profile_plot_values(col_profile, self.left_log_enabled)
+        bottom_marker_y = self._profile_marker_value(metric_value, self.bottom_log_enabled)
+        left_marker_x = self._profile_marker_value(metric_value, self.left_log_enabled)
 
         self.bottom_curve.setData(self.x_profile_coords, row_plot)
         self.left_curve.setData(col_plot, self.y_profile_coords)
-        self.bottom_marker.setData([x_value], [bottom_marker_y])
-        self.left_marker.setData([left_marker_x], [y_value])
+        if bottom_marker_y is None:
+            self.bottom_marker.setData([], [])
+        else:
+            self.bottom_marker.setData([x_value], [bottom_marker_y])
+        if left_marker_x is None:
+            self.left_marker.setData([], [])
+        else:
+            self.left_marker.setData([left_marker_x], [y_value])
 
         x_start_idx, x_end_idx, y_start_idx, y_end_idx = self._profile_visible_slice()
         visible_row = row_profile[x_start_idx:x_end_idx]
@@ -3220,11 +3289,7 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
         if self._coordinate_error_profiles_active():
             self.angle_error_profiles_widget.reset_view()
             return
-        self.image_view.setRange(
-            xRange=(float(self.display_x_edges[0]), float(self.display_x_edges[-1])),
-            yRange=(float(self.display_y_edges[0]), float(self.display_y_edges[-1])),
-            padding=0.0,
-        )
+        self._apply_full_display_range()
 
     def save_current_view(self):
         if self.data is None:

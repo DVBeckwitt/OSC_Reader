@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed detector full-extent reset in the Qt viewer:**
+  - `Detector` view now keeps enough pyqtgraph range limit slack for aspect-locked images.
+  - `Reset View` now returns to the full detector extent instead of clipping wide or tall detector frames.
+  - Status: fixed and covered by `test_detector_full_extent_covers_edges_after_load_and_reset`.
+
+- **Hardened log display controls:**
+  - `Image Log View`, `Bottom Profile Log Y`, and `Side Profile Log X` now tolerate zero, negative, `NaN`, and infinite detector values without breaking the viewer.
+  - Cached log-toggle state is restored safely before and after loading detector data.
+  - Status: fixed and covered by viewer regression tests for image log data, profile log data, and cached log state.
+
+- **Validation:**
+  - Verified with `python -m unittest discover -s tests -p "test_*.py"`.
+  - Verified with `python -m compileall OSC_Reader`.
+
 ## Changes Made in the New Version 0.3.1
 
 - **Data Reading in `convert_to_asc`:**

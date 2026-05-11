@@ -1,5 +1,6 @@
 import os
 import unittest
+import warnings
 from dataclasses import replace
 from unittest import mock
 
@@ -155,11 +156,11 @@ class ViewerErrorHelperTests(unittest.TestCase):
     def test_angle_error_profiles_fall_back_to_fast_sigma_maps_when_stats_missing(self):
         viewer = OSCViewerWindow(filename=None)
         try:
+            viewer.pixel_size_spin.setValue(0.1)
+            viewer.distance_spin.setValue(200.0)
             base_result = self._base_result()
             viewer.angle_space_result = base_result
             viewer.angle_space_error_result = None
-            viewer.pixel_size_spin.setValue(0.1)
-            viewer.distance_spin.setValue(200.0)
 
             expected_theta_source, expected_phi_source = fast_display_sigma_maps(
                 base_result,
@@ -402,6 +403,155 @@ class ViewerErrorHelperTests(unittest.TestCase):
                 viewer.azimuth_bins_spin,
             ):
                 self.assertFalse(spin.keyboardTracking())
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_detector_full_extent_covers_edges_after_load_and_reset(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.resize(1680, 1020)
+            viewer.show()
+            self._app.processEvents()
+
+            detector = np.arange(100 * 400, dtype=np.float32).reshape(100, 400)
+            viewer.set_data(detector)
+            self._app.processEvents()
+
+            x_edges = viewer.display_x_edges
+            y_edges = viewer.display_y_edges
+            x_range, y_range = viewer.image_view.viewRange()
+            self.assertLessEqual(x_range[0], x_edges[0])
+            self.assertGreaterEqual(x_range[1], x_edges[-1])
+            self.assertLessEqual(y_range[0], y_edges[0])
+            self.assertGreaterEqual(y_range[1], y_edges[-1])
+
+            viewer.image_view.setRange(
+                xRange=(100.0, 200.0),
+                yRange=(20.0, 40.0),
+                padding=0.0,
+            )
+            self._app.processEvents()
+            viewer.reset_zoom()
+            self._app.processEvents()
+
+            x_range, y_range = viewer.image_view.viewRange()
+            self.assertLessEqual(x_range[0], x_edges[0])
+            self.assertGreaterEqual(x_range[1], x_edges[-1])
+            self.assertLessEqual(y_range[0], y_edges[0])
+            self.assertGreaterEqual(y_range[1], y_edges[-1])
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_image_log_view_uses_finite_display_data_for_invalid_values(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            detector = np.array(
+                [
+                    [0.0, -1.0],
+                    [np.nan, np.inf],
+                ],
+                dtype=np.float64,
+            )
+            viewer.set_data(detector)
+
+            viewer.image_log_button.setChecked(True)
+            self._app.processEvents()
+
+            image_display = viewer._image_display_data()
+            levels = viewer.image_item.getLevels()
+            self.assertTrue(np.all(np.isfinite(image_display)))
+            self.assertTrue(np.all(np.isfinite(levels)))
+            self.assertLess(float(levels[0]), float(levels[1]))
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_image_log_view_levels_cover_transformed_low_intensity_data(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            detector = np.array(
+                [
+                    [0.001, 0.01],
+                    [0.1, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            viewer.set_data(detector)
+
+            viewer.image_log_button.setChecked(True)
+            self._app.processEvents()
+
+            image_display = viewer._image_display_data()
+            finite_display = image_display[np.isfinite(image_display)]
+            levels = viewer.image_item.getLevels()
+            self.assertLessEqual(float(levels[0]), float(np.min(finite_display)))
+            self.assertGreaterEqual(float(levels[1]), float(np.max(finite_display)))
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_profile_log_toggles_render_finite_curve_data_for_invalid_values(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            detector = np.array(
+                [
+                    [0.0, -1.0],
+                    [np.nan, np.inf],
+                ],
+                dtype=np.float64,
+            )
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                viewer.set_data(detector)
+                viewer.bottom_log_button.setChecked(True)
+                viewer.left_log_button.setChecked(True)
+                viewer.update_cursor(1, 1, force=True)
+                self._app.processEvents()
+
+            _, bottom_y = viewer.bottom_curve.getData()
+            left_x, _ = viewer.left_curve.getData()
+            self.assertTrue(np.all(np.isfinite(bottom_y)))
+            self.assertTrue(np.all(np.isfinite(left_x)))
+            self.assertTrue(viewer.bottom_log_enabled)
+            self.assertTrue(viewer.left_log_enabled)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_cached_log_state_survives_loading_data(self):
+        cache_state = {
+            "viewer": {
+                "profiles": {
+                    "image_log_enabled": True,
+                    "bottom_log_enabled": True,
+                    "left_log_enabled": True,
+                },
+            },
+        }
+        with mock.patch("OSC_Reader.OSC_Viewer._load_viewer_cache", return_value=cache_state):
+            viewer = OSCViewerWindow(filename=None)
+        try:
+            self.assertTrue(viewer.image_log_button.isChecked())
+            self.assertTrue(viewer.bottom_log_button.isChecked())
+            self.assertTrue(viewer.left_log_button.isChecked())
+
+            viewer.set_data(np.array([[0.0, 1.0], [2.0, 3.0]], dtype=np.float64))
+            self._app.processEvents()
+
+            self.assertTrue(viewer.image_log_enabled)
+            self.assertTrue(viewer.bottom_log_enabled)
+            self.assertTrue(viewer.left_log_enabled)
+            levels = viewer.image_item.getLevels()
+            self.assertTrue(np.all(np.isfinite(levels)))
+            self.assertLess(float(levels[0]), float(levels[1]))
         finally:
             viewer.close()
             self._app.processEvents()

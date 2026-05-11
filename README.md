@@ -379,6 +379,11 @@ angle-space and `q-space` rebins:
 `Image Log View` changes the rendered image intensity mapping only. It does not
 modify the underlying detector data used for conversions.
 
+Viewer status: detector reset and the three log display controls are covered by
+automated regression tests. `Reset View` should show the full detector image in
+`Detector` mode, and log controls should remain stable for zero, negative,
+missing, and infinite pixel values.
+
 ### Typical detector-to-angle workflow
 
 1. Open a detector image.
@@ -793,13 +798,15 @@ uniform `qr` and `qz` centers.
 
 ## Testing and Validation
 
-The repository does not currently ship a formal automated test suite.
+The repository ships a `unittest`-based automated test suite for detector I/O,
+angle/q-space helpers, and viewer regression coverage.
 
 ### Minimum maintenance checks
 
 When changing core parsing, conversion, or GUI code, a practical minimum is:
 
 ```bash
+python -m unittest discover -s tests -p "test_*.py"
 python -m compileall OSC_Reader
 ```
 
@@ -807,11 +814,14 @@ Then manually verify:
 
 1. A detector image opens successfully.
 2. `Detector`, `φ/2θ`, and `q-space` view switches all work.
-3. Beam-center picking lands on the intended feature.
-4. A first ROI can be drawn in `φ/2θ` view.
-5. Additional ROIs can be added, selected, deleted, and saved from the ROI
+3. `Reset View` shows the full detector frame in `Detector` view.
+4. `Image Log View`, `Bottom Profile Log Y`, and `Side Profile Log X` toggle
+   cleanly without changing the underlying detector data.
+5. Beam-center picking lands on the intended feature.
+6. A first ROI can be drawn in `φ/2θ` view.
+7. Additional ROIs can be added, selected, deleted, and saved from the ROI
    profile window.
-6. `Save Image` and ROI `Save Figure` both export expected output.
+8. `Save Image` and ROI `Save Figure` both export expected output.
 
 ### Validation materials
 
