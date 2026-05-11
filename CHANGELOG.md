@@ -12,8 +12,13 @@
   - Cached log-toggle state is restored safely before and after loading detector data.
   - Status: fixed and covered by viewer regression tests for image log data, profile log data, and cached log state.
 
+- **Fixed negative intensity color scaling:**
+  - Negative detector pixels now render as a display-only `1e20` sentinel without mutating source detector data.
+  - Automatic image color levels ignore that sentinel and ignore negative raw values, keeping the color scale nonnegative.
+  - Status: fixed and covered by viewer regression tests for linear and log image display levels.
+
 - **Validation:**
-  - Verified with `python -m unittest discover -s tests -p "test_*.py"`.
+  - Verified with `python -m pytest -q`.
   - Verified with `python -m compileall OSC_Reader`.
 
 ## Changes Made in the New Version 0.3.1

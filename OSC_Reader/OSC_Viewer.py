@@ -160,6 +160,7 @@ _ANGLE_SPACE_DISPLAY_LABELS = {
 
 _VIEWER_DEFAULT_RADIAL_BINS = 1000
 _VIEWER_DEFAULT_AZIMUTH_BINS = 720
+_IGNORED_INTENSITY_SENTINEL = 1.0e20
 
 
 def _nanmean_profile(values, *, axis):
@@ -176,6 +177,12 @@ def _nanmean_profile(values, *, axis):
 def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False, log_eps=1e-3):
     array = np.asarray(image, dtype=np.float64)
     finite = array[np.isfinite(array)]
+    ignored_high = (
+        float(np.log10(_IGNORED_INTENSITY_SENTINEL))
+        if log_enabled
+        else _IGNORED_INTENSITY_SENTINEL
+    )
+    finite = finite[finite != ignored_high]
     if finite.size == 0:
         if log_enabled:
             return float(log_eps), float(log_eps * 10.0)
@@ -192,8 +199,8 @@ def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False
     if favor_low_intensity:
         nonnegative = finite[finite >= 0.0]
         if nonnegative.size == 0:
-            nonnegative = finite
-        slider_low = 0.0 if np.any(nonnegative >= 0.0) else float(np.min(nonnegative))
+            return 0.0, 1.0
+        slider_low = 0.0
         data_max = float(np.max(nonnegative))
         quantile_high = float(np.percentile(nonnegative, 90.0))
         compressed_high = float(slider_low + 0.2 * (data_max - slider_low))
@@ -207,10 +214,12 @@ def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False
             vmax = slider_low + 1.0
         return float(slider_low), float(vmax)
 
-    display_min = float(np.min(finite))
-    display_max = float(np.max(finite))
-    slider_low = min(0.0, display_min)
-    slider_high = display_max
+    nonnegative = finite[finite >= 0.0]
+    if nonnegative.size == 0:
+        return 0.0, 1.0
+
+    slider_low = 0.0
+    slider_high = float(np.max(nonnegative))
     if np.isclose(slider_low, slider_high):
         slider_high = slider_low + 1.0
     vmin = float(np.clip(0.0, slider_low, slider_high))
@@ -1562,9 +1571,17 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
     def _image_display_data(self):
         image = np.asarray(self.data, dtype=np.float64)
+        negative = image < 0.0
+        if np.any(negative):
+            image = image.copy()
+            image[negative] = _IGNORED_INTENSITY_SENTINEL
         if not self.image_log_enabled:
             return image
-        finite_positive = image[np.isfinite(image) & (image > 0.0)]
+        finite_positive = image[
+            np.isfinite(image)
+            & (image > 0.0)
+            & (image != _IGNORED_INTENSITY_SENTINEL)
+        ]
         positive_replacement = (
             float(np.max(finite_positive)) if finite_positive.size else self.LOG_EPS
         )
