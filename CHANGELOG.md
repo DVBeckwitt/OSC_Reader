@@ -19,6 +19,10 @@
   - The automatic intensity scale lower bound is pinned to `0`, including `Image Log View`.
   - Status: fixed and covered by viewer regression tests for linear, log, `φ/2θ`, and `q-space` display levels.
 
+- **Fixed cached sampling overriding new detector loads:**
+  - Loading a detector image now keeps the sampling reset to detector width and height instead of restoring stale cached `2θ Bins` / `φ Bins` values.
+  - Status: fixed and covered by a viewer regression test with stale cached `2x2` sampling.
+
 - **Validation:**
   - Verified with `python -m pytest -q`.
   - Verified with `python -m compileall OSC_Reader`.

@@ -31,6 +31,13 @@ class ViewerErrorHelperTests(unittest.TestCase):
         if QtWidgets is not None:
             cls._app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def setUp(self):
+        self._cache_write_patch = mock.patch("OSC_Reader.OSC_Viewer._write_viewer_cache")
+        self._cache_write_patch.start()
+
+    def tearDown(self):
+        self._cache_write_patch.stop()
+
     @staticmethod
     def _base_result():
         return DetectorCakeResult(
@@ -458,6 +465,30 @@ class ViewerErrorHelperTests(unittest.TestCase):
                 viewer.azimuth_bins_spin,
             ):
                 self.assertFalse(spin.keyboardTracking())
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_cached_sampling_does_not_override_loaded_detector_dimensions(self):
+        cache_state = {
+            "viewer": {
+                "sampling": {
+                    "radial_bins": 2,
+                    "azimuth_bins": 2,
+                }
+            }
+        }
+
+        with mock.patch("OSC_Reader.OSC_Viewer._load_viewer_cache", return_value=cache_state):
+            viewer = OSCViewerWindow(filename=None)
+        try:
+            viewer.set_data(np.zeros((8, 10), dtype=np.float32))
+            viewer._apply_cached_loaded_file_state()
+            self._app.processEvents()
+
+            self.assertEqual(viewer.radial_bins_spin.value(), 10)
+            self.assertEqual(viewer.azimuth_bins_spin.value(), 8)
         finally:
             viewer.close()
             self._app.processEvents()

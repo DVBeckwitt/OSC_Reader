@@ -1870,34 +1870,9 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def _apply_cached_loaded_file_state(self):
         viewer_state = _viewer_cache_state(self._cache_state)
         geometry = viewer_state.get("geometry")
-        sampling = viewer_state.get("sampling")
 
         self._restoring_cache = True
         try:
-            if isinstance(sampling, dict):
-                radial_bins = self._coerce_int(sampling.get("radial_bins"))
-                azimuth_bins = self._coerce_int(sampling.get("azimuth_bins"))
-                if radial_bins is not None:
-                    self.radial_bins_spin.setValue(
-                        int(
-                            np.clip(
-                                radial_bins,
-                                self.radial_bins_spin.minimum(),
-                                self.radial_bins_spin.maximum(),
-                            )
-                        )
-                    )
-                if azimuth_bins is not None:
-                    self.azimuth_bins_spin.setValue(
-                        int(
-                            np.clip(
-                                azimuth_bins,
-                                self.azimuth_bins_spin.minimum(),
-                                self.azimuth_bins_spin.maximum(),
-                            )
-                        )
-                    )
-
             if isinstance(geometry, dict):
                 center_row = self._coerce_float(geometry.get("center_row_px"))
                 center_col = self._coerce_float(geometry.get("center_col_px"))
