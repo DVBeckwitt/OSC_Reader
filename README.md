@@ -386,7 +386,8 @@ missing, and infinite pixel values. In `Detector` view only, negative detector
 pixels are rendered with a display-only `1e20` sentinel and ignored when the
 viewer chooses automatic color levels. `φ/2θ` and `q-space` displays keep their
 converted values intact, while the automatic intensity scale lower bound stays
-pinned at `0`.
+pinned at `0`. Stale cached sampling values are ignored after an image load, so
+existing local viewer cache files do not need manual migration.
 
 ### Typical detector-to-angle workflow
 
@@ -805,6 +806,15 @@ uniform `qr` and `qz` centers.
 The repository ships a `unittest`-based automated test suite for detector I/O,
 angle/q-space helpers, and viewer regression coverage.
 
+There is no checked-in CI workflow yet. Treat these local commands as the
+current quality gate before committing or distributing viewer changes:
+
+```bash
+python -m pytest -q
+python -m compileall OSC_Reader
+git diff --check origin/main...HEAD
+```
+
 ### Minimum maintenance checks
 
 When changing core parsing, conversion, or GUI code, a practical minimum is:
@@ -845,6 +855,12 @@ This project is best thought of as:
 
 It is not a deployable web application, and the repository does not contain
 Docker, Kubernetes, PaaS, or service deployment configuration.
+
+Current viewer-fix status: detector reset, log display hardening, negative
+intensity scaling, and stale sampling-cache handling are fixed and covered by
+automated tests. Rollback for an internal wheel or source distribution is to
+install the previous package build or revert the corresponding git commits; no
+database, server, or user data migration is involved.
 
 ### Build a distribution
 

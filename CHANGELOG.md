@@ -23,9 +23,16 @@
   - Loading a detector image now keeps the sampling reset to detector width and height instead of restoring stale cached `2θ Bins` / `φ Bins` values.
   - Status: fixed and covered by a viewer regression test with stale cached `2x2` sampling.
 
+- **Release status:**
+  - The reported `φ/2θ` regression was traced to stale cached sampling values and is fixed.
+  - Existing `.osc_reader_cache.json` files do not need manual migration; stale sampling entries are ignored after a detector image loads.
+  - The viewer changes are ready for local smoke testing, not production-style deployment, because this repository has no service runtime or CI workflow.
+  - Known follow-up from review: coordinate-stat caches should be hardened against mutable cached arrays and bounded by memory size before wider distribution.
+
 - **Validation:**
   - Verified with `python -m pytest -q`.
   - Verified with `python -m compileall OSC_Reader`.
+  - Verified with `git diff --check origin/main...HEAD`.
 
 ## Changes Made in the New Version 0.3.1
 
