@@ -1870,14 +1870,15 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
     def _apply_cached_loaded_file_state(self):
         viewer_state = _viewer_cache_state(self._cache_state)
         geometry = viewer_state.get("geometry")
+        if not isinstance(geometry, dict):
+            return
 
         self._restoring_cache = True
         try:
-            if isinstance(geometry, dict):
-                center_row = self._coerce_float(geometry.get("center_row_px"))
-                center_col = self._coerce_float(geometry.get("center_col_px"))
-                if center_row is not None and center_col is not None:
-                    self._set_beam_center(center_row, center_col)
+            center_row = self._coerce_float(geometry.get("center_row_px"))
+            center_col = self._coerce_float(geometry.get("center_col_px"))
+            if center_row is not None and center_col is not None:
+                self._set_beam_center(center_row, center_col)
         finally:
             self._restoring_cache = False
 

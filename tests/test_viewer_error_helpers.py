@@ -32,11 +32,9 @@ class ViewerErrorHelperTests(unittest.TestCase):
             cls._app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def setUp(self):
-        self._cache_write_patch = mock.patch("OSC_Reader.OSC_Viewer._write_viewer_cache")
-        self._cache_write_patch.start()
-
-    def tearDown(self):
-        self._cache_write_patch.stop()
+        cache_write_patch = mock.patch("OSC_Reader.OSC_Viewer._write_viewer_cache")
+        cache_write_patch.start()
+        self.addCleanup(cache_write_patch.stop)
 
     @staticmethod
     def _base_result():
