@@ -382,9 +382,11 @@ modify the underlying detector data used for conversions.
 Viewer status: detector reset and the three log display controls are covered by
 automated regression tests. `Reset View` should show the full detector image in
 `Detector` mode, and log controls should remain stable for zero, negative,
-missing, and infinite pixel values. Negative detector pixels are rendered with a
-display-only `1e20` sentinel and ignored when the viewer chooses automatic color
-levels, so the automatic intensity scale lower bound stays pinned at `0`.
+missing, and infinite pixel values. In `Detector` view only, negative detector
+pixels are rendered with a display-only `1e20` sentinel and ignored when the
+viewer chooses automatic color levels. `φ/2θ` and `q-space` displays keep their
+converted values intact, while the automatic intensity scale lower bound stays
+pinned at `0`.
 
 ### Typical detector-to-angle workflow
 

@@ -543,6 +543,62 @@ class ViewerErrorHelperTests(unittest.TestCase):
             self._app.processEvents()
 
     @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_angle_space_view_does_not_mark_negative_pixels_as_detector_sentinel(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            cake = np.array(
+                [
+                    [-2.0, 0.0],
+                    [1.0, 4.0],
+                ],
+                dtype=np.float64,
+            )
+            radial_deg = np.array([10.0, 20.0], dtype=np.float64)
+            phi_deg = np.array([-45.0, 45.0], dtype=np.float64)
+
+            viewer.image_log_button.setChecked(False)
+            viewer.show_angle_space_view(cake, radial_deg, phi_deg)
+            self._app.processEvents()
+
+            image_display = viewer._image_display_data()
+            levels = viewer.image_item.getLevels()
+            self.assertEqual(float(viewer.data[0, 0]), -2.0)
+            self.assertNotIn(1.0e20, image_display)
+            self.assertEqual(float(levels[0]), 0.0)
+            self.assertLess(float(levels[1]), 1.0e20)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
+    def test_q_space_view_does_not_mark_negative_pixels_as_detector_sentinel(self):
+        viewer = OSCViewerWindow(filename=None)
+        try:
+            q_image = np.array(
+                [
+                    [-2.0, 0.0],
+                    [1.0, 4.0],
+                ],
+                dtype=np.float64,
+            )
+            qr = np.array([-1.0, 1.0], dtype=np.float64)
+            qz = np.array([-0.5, 0.5], dtype=np.float64)
+
+            viewer.image_log_button.setChecked(False)
+            viewer.show_q_space_view(q_image, qr, qz)
+            self._app.processEvents()
+
+            image_display = viewer._image_display_data()
+            levels = viewer.image_item.getLevels()
+            self.assertEqual(float(viewer.data[0, 0]), -2.0)
+            self.assertNotIn(1.0e20, image_display)
+            self.assertEqual(float(levels[0]), 0.0)
+            self.assertLess(float(levels[1]), 1.0e20)
+        finally:
+            viewer.close()
+            self._app.processEvents()
+
+    @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
     def test_log_image_view_marks_negative_pixels_without_scaling_to_them(self):
         viewer = OSCViewerWindow(filename=None)
         try:

@@ -1568,10 +1568,11 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
 
     def _image_display_data(self):
         image = np.asarray(self.data, dtype=np.float64)
-        negative = image < 0.0
-        if np.any(negative):
-            image = image.copy()
-            image[negative] = _IGNORED_INTENSITY_SENTINEL
+        if self.current_view_mode == "detector":
+            negative = image < 0.0
+            if np.any(negative):
+                image = image.copy()
+                image[negative] = _IGNORED_INTENSITY_SENTINEL
         if not self.image_log_enabled:
             return image
         finite_positive = image[

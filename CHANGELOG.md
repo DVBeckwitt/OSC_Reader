@@ -13,10 +13,11 @@
   - Status: fixed and covered by viewer regression tests for image log data, profile log data, and cached log state.
 
 - **Fixed negative intensity color scaling:**
-  - Negative detector pixels now render as a display-only `1e20` sentinel without mutating source detector data.
+  - Negative detector pixels now render as a display-only `1e20` sentinel in `Detector` view without mutating source detector data.
+  - `φ/2θ` and `q-space` displays keep their converted values instead of inheriting the detector-only sentinel.
   - Automatic image color levels ignore that sentinel and ignore negative raw values.
   - The automatic intensity scale lower bound is pinned to `0`, including `Image Log View`.
-  - Status: fixed and covered by viewer regression tests for linear and log image display levels.
+  - Status: fixed and covered by viewer regression tests for linear, log, `φ/2θ`, and `q-space` display levels.
 
 - **Validation:**
   - Verified with `python -m pytest -q`.
