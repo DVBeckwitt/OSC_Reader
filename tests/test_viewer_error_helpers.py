@@ -123,6 +123,29 @@ class ViewerErrorHelperTests(unittest.TestCase):
 
         self.assertEqual((low, high), (0.0, 1.0))
 
+    def test_default_log_image_levels_keep_zero_lower_bound(self):
+        values = np.array([-3.0, -2.0, 0.5, 20.0], dtype=np.float64)
+
+        low, high = _default_image_levels(
+            values,
+            log_enabled=True,
+            favor_low_intensity=False,
+        )
+
+        self.assertEqual(low, 0.0)
+        self.assertEqual(high, 0.5)
+
+    def test_default_log_image_levels_fall_back_to_zero_when_only_sentinel_remains(self):
+        values = np.array([20.0], dtype=np.float64)
+
+        low, high = _default_image_levels(
+            values,
+            log_enabled=True,
+            favor_low_intensity=False,
+        )
+
+        self.assertEqual((low, high), (0.0, 1.0))
+
     def test_intensity_sem_merge_does_not_force_coordinate_stats(self):
         base_result = self._base_result()
         loader = mock.Mock(side_effect=AssertionError("coordinate stats should stay lazy"))
@@ -544,13 +567,13 @@ class ViewerErrorHelperTests(unittest.TestCase):
             self._app.processEvents()
 
     @unittest.skipIf(QtWidgets is None, "Qt viewer stack unavailable")
-    def test_image_log_view_levels_cover_transformed_low_intensity_data(self):
+    def test_image_log_view_levels_keep_zero_lower_bound(self):
         viewer = OSCViewerWindow(filename=None)
         try:
             detector = np.array(
                 [
                     [0.001, 0.01],
-                    [0.1, 1.0],
+                    [1.0, 10.0],
                 ],
                 dtype=np.float64,
             )
@@ -560,9 +583,11 @@ class ViewerErrorHelperTests(unittest.TestCase):
             self._app.processEvents()
 
             image_display = viewer._image_display_data()
-            finite_display = image_display[np.isfinite(image_display)]
+            finite_display = image_display[
+                np.isfinite(image_display) & (image_display != 20.0)
+            ]
             levels = viewer.image_item.getLevels()
-            self.assertLessEqual(float(levels[0]), float(np.min(finite_display)))
+            self.assertEqual(float(levels[0]), 0.0)
             self.assertGreaterEqual(float(levels[1]), float(np.max(finite_display)))
         finally:
             viewer.close()

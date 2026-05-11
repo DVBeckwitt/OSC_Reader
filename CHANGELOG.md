@@ -14,7 +14,8 @@
 
 - **Fixed negative intensity color scaling:**
   - Negative detector pixels now render as a display-only `1e20` sentinel without mutating source detector data.
-  - Automatic image color levels ignore that sentinel and ignore negative raw values, keeping the color scale nonnegative.
+  - Automatic image color levels ignore that sentinel and ignore negative raw values.
+  - The automatic intensity scale lower bound is pinned to `0`, including `Image Log View`.
   - Status: fixed and covered by viewer regression tests for linear and log image display levels.
 
 - **Validation:**

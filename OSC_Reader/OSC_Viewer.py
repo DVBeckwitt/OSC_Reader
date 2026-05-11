@@ -184,16 +184,13 @@ def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False
     )
     finite = finite[finite != ignored_high]
     if finite.size == 0:
-        if log_enabled:
-            return float(log_eps), float(log_eps * 10.0)
         return 0.0, 1.0
 
     if log_enabled:
-        display_min = float(np.min(finite))
+        display_min = 0.0
         display_max = float(np.max(finite))
-        if np.isclose(display_min, display_max):
-            display_min -= 1.0
-            display_max += 1.0
+        if display_max <= display_min or np.isclose(display_min, display_max):
+            display_max = display_min + 1.0
         return display_min, display_max
 
     if favor_low_intensity:
