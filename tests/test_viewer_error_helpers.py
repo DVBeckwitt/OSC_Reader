@@ -55,6 +55,14 @@ class ViewerErrorHelperTests(unittest.TestCase):
             azimuthal_label_sigma_deg=np.zeros(shape, dtype=np.float64),
         )
 
+    def _assert_converted_view_preserves_negative_display(self, viewer):
+        image_display = viewer._image_display_data()
+        levels = viewer.image_item.getLevels()
+        self.assertEqual(float(viewer.data[0, 0]), -2.0)
+        self.assertFalse(np.any(image_display == 1.0e20))
+        self.assertEqual(float(levels[0]), 0.0)
+        self.assertLess(float(levels[1]), 1.0e20)
+
     def test_nanmean_profile_ignores_missing_bins(self):
         values = np.array(
             [
@@ -560,12 +568,7 @@ class ViewerErrorHelperTests(unittest.TestCase):
             viewer.show_angle_space_view(cake, radial_deg, phi_deg)
             self._app.processEvents()
 
-            image_display = viewer._image_display_data()
-            levels = viewer.image_item.getLevels()
-            self.assertEqual(float(viewer.data[0, 0]), -2.0)
-            self.assertNotIn(1.0e20, image_display)
-            self.assertEqual(float(levels[0]), 0.0)
-            self.assertLess(float(levels[1]), 1.0e20)
+            self._assert_converted_view_preserves_negative_display(viewer)
         finally:
             viewer.close()
             self._app.processEvents()
@@ -588,12 +591,7 @@ class ViewerErrorHelperTests(unittest.TestCase):
             viewer.show_q_space_view(q_image, qr, qz)
             self._app.processEvents()
 
-            image_display = viewer._image_display_data()
-            levels = viewer.image_item.getLevels()
-            self.assertEqual(float(viewer.data[0, 0]), -2.0)
-            self.assertNotIn(1.0e20, image_display)
-            self.assertEqual(float(levels[0]), 0.0)
-            self.assertLess(float(levels[1]), 1.0e20)
+            self._assert_converted_view_preserves_negative_display(viewer)
         finally:
             viewer.close()
             self._app.processEvents()

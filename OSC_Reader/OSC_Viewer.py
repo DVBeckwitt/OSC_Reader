@@ -174,7 +174,7 @@ def _nanmean_profile(values, *, axis):
     return profile
 
 
-def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False, log_eps=1e-3):
+def _default_image_levels(image, *, log_enabled=False, favor_low_intensity=False):
     array = np.asarray(image, dtype=np.float64)
     finite = array[np.isfinite(array)]
     ignored_high = (
@@ -1600,7 +1600,6 @@ class OSCViewerWindow(QtWidgets.QMainWindow):
             image_display,
             log_enabled=self.image_log_enabled,
             favor_low_intensity=self._intensity_error_display_active(),
-            log_eps=self.LOG_EPS,
         )
         self.image_item.setLevels((vmin_default, vmax_default))
         self.hist_lut.setLevels(vmin_default, vmax_default)
